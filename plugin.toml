@@ -1,0 +1,12 @@
+schema = 1
+id = "tern-rss"
+name = "Tern RSS"
+version = "0.1.0"
+description = "RSS and Atom feeds in a Tern block: headlines, previews, a docked reader, favorites and catch-up."
+icon = "newspaper"
+host = "host.luau"
+window = "window.luau"
+
+[[blocks]]
+id = "rss"
+title = "RSS"
