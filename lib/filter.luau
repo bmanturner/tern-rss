@@ -81,7 +81,40 @@ local function trim(s: string): string
 	return string.sub(s, first, last)
 end
 
+-- Whether `pat` carries a `|` at its top level, outside any group or class and not escaped. Only
+-- such a pattern needs the group the engine requires.
+local function has_top_alternation(pat: string): boolean
+	local depth, i = 0, 1
+	while i <= #pat do
+		local c = string.sub(pat, i, i)
+		if c == "\\" then
+			i += 1
+		elseif c == "(" then
+			-- A group, a flag group or a look-around: each closes with a `)`.
+			depth += 1
+		elseif c == ")" then
+			depth -= 1
+		elseif c == "[" then
+			local close = string.find(pat, "]", i + 1, true)
+			i = if close then close else #pat
+		elseif c == "|" and depth == 0 then
+			return true
+		end
+		i += 1
+	end
+	return false
+end
+
 -- Compiles `pat` with `flags`. Returns the compiled pattern, or nil and the engine's complaint.
+--
+-- Two of the vendored engine's behaviours are worked around here, both verified against it:
+--
+--   * Top-level alternation only ever matches at the first position, so `/ads|广告/` misses a post
+--     whose title starts with something else. Wrapping the pattern in a group fixes it, and only a
+--     pattern that really carries a top-level `|` is wrapped: a group around a pattern that matches
+--     nothing on its own, such as a lone lookahead, would change what the pattern matches.
+--   * `\b` and `\B` raise at match time rather than compile time. They are refused here, so the
+--     problem shows up under the field instead of in the middle of a list.
 function filter.compile(pat: string, flags: string): (any?, string?)
 	for i = 1, #flags do
 		local c = string.sub(flags, i, i)
@@ -89,8 +122,12 @@ function filter.compile(pat: string, flags: string): (any?, string?)
 			return nil, `Unknown flag "{c}"; the flags are i, m, s and x`
 		end
 	end
+	if string.find(pat, "\\[bB]") then
+		return nil, "The engine cannot run \\b or \\B; use a capture like (^| )word, or stop at spaces"
+	end
+	local source = if has_top_alternation(pat) then `(?:{pat})` else pat
 	local ok, rx = pcall(function()
-		return regexp.new(pat, flags)
+		return regexp.new(source, flags)
 	end)
 	if not ok then
 		-- The engine names its own file and line; the field wants the complaint, not the path.
@@ -134,10 +171,17 @@ function filter.parse(line: string): (Rule?, string?)
 	local head = trim(string.sub(s, 1, open - 1))
 	local action = "drop"
 	local lower = string.lower(head)
-	if lower == "keep" or string.sub(lower, -5) == " keep" then
+	-- The bare word and the trailing word are separate cases: stripping " keep" off the four-letter
+	-- "keep" would take a negative count and leave the word in place.
+	if lower == "keep" then
+		action = "keep"
+		head = ""
+	elseif lower == "drop" then
+		head = ""
+	elseif string.sub(lower, -5) == " keep" then
 		action = "keep"
 		head = trim(string.sub(head, 1, #head - 5))
-	elseif lower == "drop" or string.sub(lower, -5) == " drop" then
+	elseif string.sub(lower, -5) == " drop" then
 		head = trim(string.sub(head, 1, #head - 5))
 	end
 	local scope: Scope = { kind = "all" }
@@ -327,5 +371,4 @@ function filter.decode(v: any): (Config, number)
 	end
 	return cfg, bad
 end
-
 return filter

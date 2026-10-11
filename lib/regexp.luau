@@ -4,6 +4,9 @@
 -- engine, adapted from Blockzez. MIT (see lib/regexp.LICENSE). Keep it byte-for-byte apart from
 -- this header: it is third-party code, so `--!nolint --!nocheck` stay on and nothing is renamed.
 --
+-- Patched, and the only change: `re.new` sets `caseless` and `dotall`, while the matcher read
+-- `ignoreCase` and `dotAll`, so the `i` and `s` flags did nothing at all (as of upstream
+-- 2102-line HEAD). Those reads are renamed here. Nothing else is touched.
 -- Why it lives here: Luau ships no regex and Tern has no dependency manager, so a plugin that
 -- wants real patterns has to carry the engine. lib/filter.luau is the only caller.
 --[[
@@ -345,7 +348,7 @@ local function tkn_char_match(tkn_part, str_arr, i, flags, verb_flags)
 	local chr = str_arr[i];
 	if not chr then
 		return false;
-	elseif flags.ignoreCase and chr >= 0x61 and chr <= 0x7A then
+	elseif flags.caseless and chr >= 0x61 and chr <= 0x7A then
 		chr -= 0x20;
 	end;
 	if type(tkn_part) == "number" then
@@ -358,7 +361,7 @@ local function tkn_char_match(tkn_part, str_arr, i, flags, verb_flags)
 		end;
 		return tkn_part[2];
 	elseif tkn_part[1] == "range" then
-		return chr >= tkn_part[2] and chr <= tkn_part[3] or flags.ignoreCase and chr >= 0x41 and chr <= 0x5A and (chr + 0x20) >= tkn_part[2] and (chr + 0x20) <= tkn_part[3];
+		return chr >= tkn_part[2] and chr <= tkn_part[3] or flags.caseless and chr >= 0x41 and chr <= 0x5A and (chr + 0x20) >= tkn_part[2] and (chr + 0x20) <= tkn_part[3];
 	elseif tkn_part[1] == "class" then
 		local char_class = tkn_part[2];
 		local negate = tkn_part[3];
@@ -452,7 +455,7 @@ local function tkn_char_match(tkn_part, str_arr, i, flags, verb_flags)
 		end;
 		return tkn_part[2];
 	elseif tkn_part[1] == 0x2E then
-		return flags.dotAll or not is_newline(str_arr, i, verb_flags);
+		return flags.dotall or not is_newline(str_arr, i, verb_flags);
 	elseif tkn_part[1] == 0x4E then
 		return not is_newline(str_arr, i, verb_flags);
 	elseif tkn_part[1] == 0x52 then
@@ -1596,7 +1599,7 @@ local function tokenize_ptn(codes, flags)
 						local esc_char = escape_chars[codes[i]];
 						table.insert(ret, 1, type(esc_char) == "string" and { "class", esc_char, false } or esc_char or codes[i]);
 					end;
-				elseif flags.ignoreCase and codes[i] >= 0x61 and codes[i] <= 0x7A then
+				elseif flags.caseless and codes[i] >= 0x61 and codes[i] <= 0x7A then
 					table.insert(ret, 1, codes[i] - 0x20);
 				else
 					table.insert(ret, 1, codes[i]);
@@ -1860,7 +1863,7 @@ local function tokenize_ptn(codes, flags)
 			until not v1;
 		elseif c == 0x24 or c == 0x5E then
 			table.insert(outln, c == 0x5E and beginning_str or end_str);
-		elseif flags.ignoreCase and c >= 0x61 and c <= 0x7A then
+		elseif flags.caseless and c >= 0x61 and c <= 0x7A then
 			table.insert(outln, c - 0x20);
 		elseif flags.extended and (c >= 0x09 and c <= 0x0D or c == 0x20 or c == 0x23) then
 			if c == 0x23 then

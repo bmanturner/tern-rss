@@ -110,6 +110,40 @@ A rule is one line, and the common case is just a pattern:
 
 The pattern is a real regular expression, with `i` (caseless), `m` (multiline), `s` (dotall) and `x` (spaced) flags after the closing slash. A pattern that does not compile is refused in the field, with the engine's reason. Patterns see the post's text as it is: the title and the feed's preview.
 
+#### What to write
+
+Every line below is a whole rule, checked against the engine that ships in the package:
+
+| Want | Write | Notes |
+| --- | --- | --- |
+| Hide sponsored posts anywhere | `/sponsor/i` | `i` covers `Sponsor`, `SPONSOR`, `sponsored` |
+| Hide either of two words | `/赞助|推广/` | alternation, no group needed |
+| Hide Chinese and English spellings | `/(?:sponsor|广告)/i` | `(?:…)` groups the alternation |
+| Hide anything with a price | `/\d{3,}元/` | `\d` digit, `{3,}` three or more |
+| Hide posts that start with a marker | `/^(▲|Show HN)/` | `^` anchors to the start of the title |
+| Hide posts that end with a word | `/周刊$/` | `$` anchors to the end |
+| Hide a word, but not inside a longer one | `/(^| )word( |$)/` | `\b` is not available; see below |
+| Hide one feed's ads | `#Rust Weekly /ads?/i` | feed by title; spaces need no quoting |
+| Hide a site's promos | `#lobste.rs /promo/` | feed by host also works |
+| Hide a whole group's off-topic posts | `@news /^\[OT\]/` | group scope |
+| Hide everything except one topic | `keep /rust|zig/i` then `/./` | first match wins, so the exception goes above |
+| Hide pricing symbols anywhere | `/[$€£]\d+/` | a class covers several symbols at once |
+| Hide post series by number | `/连载\s?\d+/` | `\s` is whitespace, `?` makes it optional |
+| Ignore case **and** allow spaces for readability | `/s p o n s o r/ix` | `x` drops whitespace from the pattern |
+| Match a literal slash | `/事件\/回顾/` | escape the slash, or the pattern ends early |
+
+The two rules that keep one topic out of an otherwise noisy feed, in the order they must appear:
+
+```text
+keep /(rust|zig|lua)/i
+/./
+```
+
+Two shapes the engine cannot run, both refused under the field rather than failing quietly:
+
+- `\b` and `\B` raise at match time in the vendored engine, so they are rejected when the rule is parsed. Write the boundaries by hand: `/(^| )word( |$)/`.
+- A pattern has to be inside `/…/`. A bare `sponsor` is refused with "A rule needs a /pattern/".
+
 Luau ships no regular expressions, and Tern has no dependency manager, so the engine is vendored: `lib/regexp.luau` is [Roblox's luau-regexp](https://github.com/Roblox/luau-regexp) (MIT, from Blockzez), carried in the package and licensed beside it in `lib/regexp.LICENSE`. It is in-process Luau, so the plugin still runs **no programs**. A pattern that backtracks badly can be slow: keep rules simple.
 
 Rules are read in order and the first match decides: `drop` hides the post, `keep` shows it. When no rule matches, the group gate decides. `/./` hides everything, so `keep` rules above it are a whitelist. Catch-up on Latest covers the feeds the group gate keeps; posts a rule hides are caught up with their feed.
