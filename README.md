@@ -37,9 +37,9 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 
 | Tab | Shows |
 | --- | --- |
-| Latest | Headlines from every feed. Posts that arrived since you last caught up come first, with `●` and a strong title. A "caught up" line separates them from older posts. Read posts dim in place, so nothing moves under the cursor. |
-| ★ Favorites | Headlines from starred feeds only. |
-| Feeds | Your subscriptions with new-post counts and refresh errors, plus sites Carly is still searching. Star, catch up, remove and add feeds here. |
+| Latest | Headlines from every feed. Posts that arrived since you last caught up come first, with `●` and a strong title. A "caught up" line separates them from older posts. Read posts dim in place, so nothing moves under the cursor. The filter (`f`) narrows this tab. |
+| ★ Favorites | Headlines from starred feeds only. The filter doesn't apply here. |
+| Feeds | Your subscriptions with new-post counts and refresh errors, plus sites Carly is still searching. Star, catch up, group, remove and add feeds here; grouped feeds sit under a header row. |
 
 ![The Favorites tab beside the docked reader browser, which shows an open article](docs/reader.png)
 
@@ -59,6 +59,8 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `a`, or paste a URL | Add a feed |
 | `r` | Refresh every feed now |
 | `c` | Ask Carly to find a feed after one wasn't found; `esc` dismisses |
+| `f` (Latest) | Edit the filter: groups, then ordered rules |
+| `t` (Feeds) | Set the selected feed's group (`t`, since `g` jumps to the top) |
 
 ### Counts and catch-up
 
@@ -80,6 +82,33 @@ Unreachable hosts and bad addresses show their error under the add field. When t
 > [!NOTE]
 > Asking Carly needs the window and the RSS block to share the plugin data directory. When the RSS block runs on a remote host, Carly isn't asked, and the search ends after 10 minutes with the "Carly didn't finish the search" toast.
 
+### Groups and the filter
+
+A feed's group is one line of text; a feed with none is ungrouped. On Feeds, `t` opens a one-line field with the selected feed's group in it: Enter assigns it, an empty line leaves the group, and a name that isn't taken yet makes a new group. Once any feed is grouped, the Feeds list draws a header row per group and nests that group's feeds under it. Header rows aren't selectable, so selection stays on feed ids. Groups come from the feeds themselves: remove the last feed of a group and the group goes with it.
+
+The filter narrows Latest. `f` opens it, and `esc` or `f` closes it. It is a group gate plus an ordered list of rules, and a status line above the headlines always shows what it is doing, with the Latest tab counting only the posts the filter shows:
+
+```text
+Filter 1 group in · 1 rule · 4 posts hidden   f edit
+```
+
+- **Groups.** One row per group, plus an "Every group" row. `space` checks the group under the cursor; the checked groups are a whitelist, and with nothing checked every group is in. `x` excludes a group, which always loses; a group is never both checked and excluded. `space` on "Every group" unchecks every group, which is the same as "all".
+- **Rules.** Rows are numbered in the order they are read, each shown as `<n> drop|keep <pattern>  <scope>`. `a` adds a rule (the field opens prefilled with the group under the cursor, when there is one), `d` deletes the selected rule, and `K` / `J` move it up or down in that order. `j` / `k` and the arrows move the cursor.
+
+A rule line reads `[scope] drop|keep pattern`:
+
+| Scope | Matches |
+| --- | --- |
+| `all` (the default) | every post |
+| `g:<group>` | posts whose feed is in that group |
+| `f:<feed>` | posts from one feed: its id, its exact title, or its host |
+
+A scope name with spaces is quoted: `f:"Rust Weekly" drop sponsor`. The pattern is a Luau (Lua) pattern, not a regular expression: `%d` is a digit, `.-` is lazy, and there is no `|` or `(?:)`. A pattern Luau cannot compile is refused in the field, with the reason. Patterns see the post's text as it is, the title and the feed's preview, so write `[Ss]ponsor` where case matters.
+
+Rules are read in order and the first match decides: `drop` hides the post, `keep` shows it. When no rule matches, the group gate decides. `all drop .` hides everything, so `keep` rules above it act as a whitelist. Catch-up on Latest covers the feeds the group gate keeps; posts a rule hides are caught up with their feed.
+
+The filter belongs to Latest only, so Favorites shows every starred feed as is. Like the feed list, it is shared by every RSS block in this host.
+
 ### Refresh and toasts
 
 - Feeds refresh every 15 minutes while any RSS block is open. A background tab is fine.
@@ -99,6 +128,14 @@ The refresh interval is the kv key `config/block/rss/refresh_minutes` (default 1
 
 The value is re-read before each refresh and shared by all RSS blocks.
 
+The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filters.json` in the plugin data directory, where it is hand-editable:
+
+```json
+{"version":1,"groups":{"tech":true},"excluded":{},"rules":["f:\"Rust Weekly\" keep .","all drop [Ss]ponsor"]}
+```
+
+`groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter is off; a rule line that doesn't parse is dropped, with a warning in the log. The filter is shared by every RSS block in this host, like the feed list.
+
 ## Privacy
 
 - **Network:** the plugin fetches the feed URLs you follow. While you add a site, it also fetches candidate feed URLs on that site's host and links the page itself points to. Candidates on loopback or private-network addresses are skipped unless the URL you pasted is itself local. Articles you open load in Tern's browser.
@@ -112,7 +149,7 @@ The value is re-read before each refresh and shared by all RSS blocks.
 
 - **Network:** each feed URL with `tern.fetch`, every refresh interval while an RSS block is open. Requests are conditional (`If-None-Match` / `If-Modified-Since`), at most 4 at a time, with a 20 s timeout; bodies over 4 MB are rejected. Adding a site also fetches its feed candidates, at most 4 at a time with a 10 s timeout each.
 - **Programs:** none.
-- **Writes:** in the plugin data directory, `rss/feeds.json`, `rss/read.json`, `rss/cache/<feed>.json` and, only after you ask Carly, `rss/carly/<id>.{request,answer,asked,result}.json`; `kv.json` only when config is set. Nothing in the package folder.
+- **Writes:** in the plugin data directory, `rss/feeds.json` (each feed and its group), `rss/read.json`, `rss/filters.json`, `rss/cache/<feed>.json` and, only after you ask Carly, `rss/carly/<id>.{request,answer,asked,result}.json`; `kv.json` only when config is set. Nothing in the package folder.
 - **Reads:** `plugin.toml`, the `blocks/` listing, and the files above.
 - **Logs:** warn lines prefixed `tern-rss`.
 
@@ -158,6 +195,7 @@ lib/fmt.luau           times, ages, counts, durations, clipping        (both hal
 lib/url.luau           percent-encoding, URL normalize/host/resolve    (both halves)
 lib/feed.luau          RSS/Atom/RDF parser, feed candidates, dates     (both halves, pure)
 lib/carly.luau         find-a-feed hand-off files between the halves   (both halves)
+lib/filter.luau        Latest filter: groups, rule parsing, matching   (both halves, pure)
 lib/store.luau         feeds, read/catch-up state, caches, polling,
                        toasts, adding with probing, Carly searches     (host only)
 docs/                  README screenshots

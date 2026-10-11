@@ -31,7 +31,9 @@ Lives inside Tern as a block. Reading happens in one Tern browser block docked b
 - RSS 2.0, RSS 1.0 and Atom feeds. A pasted site is searched for its feed (feed links, platform URLs, usual paths); when that fails, the block offers to ask Carly, and Carly is asked only if the user chooses to (a toast reports the result). Starter feeds never go to Carly.
 - Not an inbox: counts mean "new since you last caught up" (`shift+m`, undoable), never a growing unread backlog; the pane title counts only new posts from favorite feeds.
 - Favorite and Carly toasts only fire while an RSS block is open somewhere in the session.
-- Data (feeds, catch-up times, read state, caches, Carly hand-off files) lives in the plugin data directory.
+- Subscription groups: one group name per feed, set with `t` on Feeds (an empty line leaves it, a new name makes a new group). Grouped feeds sit under a header row, and a group goes when its last feed does: groups are read from the feeds, not stored on their own.
+- The Latest filter (`f`): a group whitelist with exclusions, then ordered `drop` / `keep` rules matched as Lua patterns against a post's title and preview, first match wins. It scopes Latest only, so Favorites stays every favorite as is, and catch-up on Latest covers the feeds the group gate keeps.
+- Data (feeds and their groups, the Latest filter, catch-up times, read state, caches, Carly hand-off files) lives in the plugin data directory.
 - No accounts or sync.
 
 ## Brand Commitments
