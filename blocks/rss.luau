@@ -346,9 +346,9 @@ end
 -- What `a` fills the rule field with: the group under the cursor, when there is one.
 local function panel_prefill(row: PanelRow): string
 	if row.kind == "group" and row.name ~= nil and row.name ~= filter.UNGROUPED then
-		return filter.scope_text({ kind = "group", name = row.name }) .. " drop "
+		return filter.scope_text({ kind = "group", name = row.name }) .. " "
 	end
-	return "all drop "
+	return ""
 end
 
 -- New unread posts: those from favorite feeds, per feed id, and those the Latest filter shows.
@@ -825,7 +825,7 @@ local function field_placeholder(f: Field): string
 	if f.intent == "folder" then
 		return "Group name, then Enter (an empty line leaves the group)"
 	elseif f.intent == "rule" then
-		return "all drop sponsor   (scope: all | g:group | f:feed)"
+		return "/sponsor/ or @group /sponsor/i — hides matching posts"
 	end
 	return "Paste a site or feed URL, then press Enter"
 end
@@ -1180,10 +1180,10 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node })
 						key = "r" .. index,
 						label = {
 							span(tostring(index) .. " ", "num"),
-							span(if rule.drop then "drop " else "keep ", if rule.drop then "error" else "accent"),
-							span(rule.pat),
+							span(if rule.drop then "" else "keep ", if rule.drop then "muted" else "accent"),
+							span(`/{rule.pat}/{rule.flags}`, if rule.drop then "error" else "accent"),
 						},
-						detail = filter.scope_text(rule.scope),
+						detail = if rule.scope.kind == "all" then "every feed" else filter.scope_text(rule.scope),
 						value = { span("K/J · d", "muted") },
 					})
 				)
@@ -1219,14 +1219,18 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node })
 		cards.with(
 			ui.text({
 				span("Rules are read in order and the first match decides: ", "muted"),
-				span("drop", "error"),
+				span("/pattern/", "error"),
 				span(" hides, ", "muted"),
 				span("keep", "accent"),
-				span(" shows. Patterns are Luau patterns: ", "muted"),
-				span("%d", "code"),
-				span(" digit, ", "muted"),
-				span(".-", "code"),
-				span(" lazy.", "muted"),
+				span(" shows. Flags follow the closing slash: ", "muted"),
+				span("i", "code"),
+				span(" caseless, ", "muted"),
+				span("m", "code"),
+				span(" multiline, ", "muted"),
+				span("s", "code"),
+				span(" dotall, ", "muted"),
+				span("x", "code"),
+				span(" spaced.", "muted"),
 			}),
 			{ key = "filter-help" }
 		)

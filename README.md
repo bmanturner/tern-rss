@@ -93,21 +93,26 @@ The filter narrows Latest. `f` opens it, and `esc` or `f` closes it. It is a rea
 Filter 1 group in · 1 rule · 4 posts hidden   f edit
 ```
 
-- **Read state.** The first row steps through every post, unread only, and read only with `space` or `x`. This is a hard gate: it decides before the groups and the rules do, so "unread only" means unread.
+- **Read state.** The first row steps through every post, unread only, and read only with `space` or `x`. The filter starts at **unread only**, so a reader that already knows what you have read buries what you have not. This is a hard gate: it decides before the groups and the rules do, so "unread only" means unread.
 - **Groups.** One row per group, plus an "Every group" row. `space` checks the group under the cursor; the checked groups are a whitelist, and with nothing checked every group is in. `x` excludes a group, which always loses; a group is never both checked and excluded. `space` on "Every group" unchecks every group, which is the same as "all".
-- **Rules.** Rows are numbered in the order they are read, each shown as `<n> drop|keep <pattern>  <scope>`. `a` adds a rule (the field opens prefilled with the group under the cursor, when there is one), `d` deletes the selected rule, and `K` / `J` move it up or down in that order. `j` / `k` and the arrows move the cursor.
+- **Rules.** Rows are numbered in the order they are read, each shown as `<n> /pattern/flags  <scope>`. `a` adds a rule (the field opens prefilled with the group under the cursor, when there is one), `d` deletes the selected rule, and `K` / `J` move it up or down in that order. `j` / `k` and the arrows move the cursor.
 
-A rule line reads `[scope] drop|keep pattern`:
+A rule is one line, and the common case is just a pattern:
 
-| Scope | Matches |
-| --- | --- |
-| `all` (the default) | every post |
-| `g:<group>` | posts whose feed is in that group |
-| `f:<feed>` | posts from one feed: its id, its exact title, or its host |
+```text
+/sponsor/                  hide matching posts, everywhere
+@frontend /sponsor/        ... in one group only
+#Rust Weekly /ads?/i       ... in one feed only (no quoting, spaces are fine)
+@frontend keep /rust/      show a matching post again (an exception to a drop)
+```
 
-A scope name with spaces is quoted: `f:"Rust Weekly" drop sponsor`. The pattern is a Luau (Lua) pattern, not a regular expression: `%d` is a digit, `.-` is lazy, and there is no `|` or `(?:)`. A pattern Luau cannot compile is refused in the field, with the reason. Patterns see the post's text as it is, the title and the feed's preview, so write `[Ss]ponsor` where case matters.
+`drop` only has to be written to be explicit; leaving it out means drop. A scope is `@group` or `#feed`, and a feed is named by its title, its address, or its host.
 
-Rules are read in order and the first match decides: `drop` hides the post, `keep` shows it. When no rule matches, the group gate decides. `all drop .` hides everything, so `keep` rules above it act as a whitelist. Catch-up on Latest covers the feeds the group gate keeps; posts a rule hides are caught up with their feed.
+The pattern is a real regular expression, with `i` (caseless), `m` (multiline), `s` (dotall) and `x` (spaced) flags after the closing slash. A pattern that does not compile is refused in the field, with the engine's reason. Patterns see the post's text as it is: the title and the feed's preview.
+
+Luau ships no regular expressions, and Tern has no dependency manager, so the engine is vendored: `lib/regexp.luau` is [Roblox's luau-regexp](https://github.com/Roblox/luau-regexp) (MIT, from Blockzez), carried in the package and licensed beside it in `lib/regexp.LICENSE`. It is in-process Luau, so the plugin still runs **no programs**. A pattern that backtracks badly can be slow: keep rules simple.
+
+Rules are read in order and the first match decides: `drop` hides the post, `keep` shows it. When no rule matches, the group gate decides. `/./` hides everything, so `keep` rules above it are a whitelist. Catch-up on Latest covers the feeds the group gate keeps; posts a rule hides are caught up with their feed.
 
 The filter belongs to Latest only, so Favorites shows every starred feed as is. Like the feed list, it is shared by every RSS block in this host.
 
@@ -133,7 +138,7 @@ The value is re-read before each refresh and shared by all RSS blocks.
 The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filters.json` in the plugin data directory, where it is hand-editable:
 
 ```json
-{"version":1,"read":"all","groups":{"tech":true},"excluded":{},"rules":["f:\"Rust Weekly\" keep .","all drop [Ss]ponsor"]}
+{"version":1,"read":"unread","groups":{"tech":true},"excluded":{},"rules":["#Rust Weekly keep /./","/sponsor/i"]}
 ```
 
 `read` is `all`, `unread` or `read`, `groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter is off; a rule line that doesn't parse is dropped, with a warning in the log. The filter is shared by every RSS block in this host, like the feed list.
@@ -196,8 +201,9 @@ lib/poll.luau          pane liveness check                             (host onl
 lib/fmt.luau           times, ages, counts, durations, clipping        (both halves)
 lib/url.luau           percent-encoding, URL normalize/host/resolve    (both halves)
 lib/feed.luau          RSS/Atom/RDF parser, feed candidates, dates     (both halves, pure)
+lib/filter.luau        the Latest filter: rules, parser, match test     (both halves, pure)
+lib/regexp.luau        vendored regex engine (MIT; see its LICENSE)     (both halves, pure)
 lib/carly.luau         find-a-feed hand-off files between the halves   (both halves)
-lib/filter.luau        Latest filter: groups, rule parsing, matching   (both halves, pure)
 lib/store.luau         feeds, read/catch-up state, caches, polling,
                        toasts, adding with probing, Carly searches     (host only)
 docs/                  README screenshots
@@ -207,7 +213,7 @@ LICENSE                MIT
 
 ## Contributing
 
-Questions, bug reports and pull requests are welcome in [issues](https://github.com/bmanturner/tern-rss/issues) and [pull requests](https://github.com/bmanturner/tern-rss/pulls). Set up with the [Develop](#develop) steps. Keep every file `--!strict`, and type-check with luau-lsp against the `tern.d.luau` that `tern plugin types .` writes.
+Questions, bug reports and pull requests are welcome in [issues](https://github.com/bmanturner/tern-rss/issues) and [pull requests](https://github.com/bmanturner/tern-rss/pulls). Set up with the [Develop](#develop) steps. Keep every file `--!strict`, and type-check with luau-lsp against the `tern.d.luau` that `tern plugin types .` writes. `lib/regexp.luau` is the one exception: it is vendored third-party code, so leave it as it came, license and all.
 
 ## License
 

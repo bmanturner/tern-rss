@@ -32,8 +32,9 @@ Lives inside Tern as a block. Reading happens in one Tern browser block docked b
 - Not an inbox: counts mean "new since you last caught up" (`shift+m`, undoable), never a growing unread backlog; the pane title counts only new posts from favorite feeds.
 - Favorite and Carly toasts only fire while an RSS block is open somewhere in the session.
 - Subscription groups: one group name per feed, set with `t` on Feeds (an empty line leaves it, a new name makes a new group). Grouped feeds sit under a header row, and a group goes when its last feed does: groups are read from the feeds, not stored on their own.
-- The Latest filter (`f`): a read-state gate (every post, unread only, read only), then a group whitelist with exclusions, then ordered `drop` / `keep` rules matched as Lua patterns against a post's title and preview, first match wins. It scopes Latest only, so Favorites stays every favorite as is, and catch-up on Latest covers the feeds the group gate keeps.
+- The Latest filter (`f`): a read-state gate (starting at unread only), then a group whitelist with exclusions, then ordered `drop` / `keep` rules written as everyday regular expressions (`/sponsor/i`, `@frontend drop /ads/`) and matched against a post's title and preview, first match wins. It scopes Latest only, so Favorites stays every favorite as is, and catch-up on Latest covers the feeds the group gate keeps.
 - Read state is per post (`m`, or `shift+r` for every post the tab shows) and never a backlog: it exists to filter and to dim, and the counts stay "new since you last caught up".
+- Luau has no regular expressions and Tern has no dependency manager, so the engine is vendored in the package (MIT, Roblox's luau-regexp). It is in-process Luau: the plugin still runs no programs.
 - Data (feeds and their groups, the Latest filter, catch-up times, read state, caches, Carly hand-off files) lives in the plugin data directory.
 - No accounts or sync.
 
