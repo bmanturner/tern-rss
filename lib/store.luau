@@ -11,6 +11,7 @@ local config = require("./config")
 local poll = require("./poll")
 local carly = require("./carly")
 local filter = require("./filter")
+local fmt = require("./fmt")
 
 local store = {}
 
@@ -22,6 +23,8 @@ export type Feed = {
 	site: string?,
 	-- The subscription group the user put it in; nil or "" is ungrouped.
 	folder: string?,
+	-- True when `title` is the user's own, so a refresh stops overwriting it with the feed's.
+	title_set: boolean,
 	favorite: boolean,
 	added: number,
 	seen_until: number?,
@@ -272,6 +275,7 @@ local function parse_feed_record(v: any): Feed?
 		title = nonempty(opt_string(v.title)) or url.host(u),
 		site = opt_string(v.site),
 		folder = nonempty(opt_string(v.folder)),
+		title_set = v.title_set == true,
 		favorite = v.favorite == true,
 		added = opt_number(v.added) or os.time(),
 		seen_until = opt_number(v.seen_until),
@@ -634,7 +638,8 @@ local function apply(f: Feed, parsed: feed.Parsed, r: FetchResult): (number, str
 	save_cache(id, cache)
 
 	local changed = false
-	if title and title ~= f.title then
+	-- A title the user typed wins over the feed's own, or every refresh would undo the rename.
+	if title and not f.title_set and title ~= f.title then
 		f.title = title
 		changed = true
 	end
@@ -1097,6 +1102,65 @@ local function probe(candidates: { string }, done: (target: string?, r: FetchRes
 	launch()
 end
 
+-- Renames `id` to `title` and moves it to `url`. Empty strings mean "leave as it is", so a feed can
+-- be renamed without refetching and retargeted without renaming. A new URL is probed like a feed the
+-- user just added: `done` gets the error when it isn't a feed, and the feed keeps its old URL.
+-- Returns false when there is no such feed or nothing to change.
+function store.rename(id: string, title: string, target: string, done: (string?) -> ()): boolean
+	ensure_loaded()
+	local f = find(id)
+	if not f then
+		return false
+	end
+	local want = nonempty(title)
+	local u = nonempty(target)
+	if want == nil and (u == nil or u == f.url) then
+		return false
+	end
+	if want then
+		-- The same clip the parser uses, so a hand-edited title is the same length a fetched one is.
+		f.title = fmt.clip(want, 200)
+		f.title_set = true
+	end
+	items_memo = nil
+	save_feeds()
+	notify()
+	-- The record on disk keeps the old URL until the probe passes: a saved bad URL would survive a
+	-- restart, and then every refresh of this feed would fail until the user edited it again.
+	if u == nil or u == f.url then
+		done(nil)
+		return true
+	end
+	-- A different URL is a different feed: show it fetching while the probe is out.
+	statuses[id] = { state = "loading" }
+	next_at[id] = 0
+	notify()
+	probe({ u }, function(hit: string?, r: FetchResult?, parsed: feed.Parsed?)
+		local again = find(id)
+		if again == nil then
+			return -- Removed while the probe was out.
+		end
+		if hit == nil or parsed == nil or r == nil then
+			statuses[id] = { state = "error", error = `{(url.host(u))} isn't serving an RSS or Atom feed.` }
+			notify()
+			done(`{url.host(u)} isn't serving an RSS or Atom feed.`)
+			return
+		end
+		again.url = u
+		local res = r :: FetchResult
+		items_memo = nil
+		apply(again, parsed, res)
+		-- The URL itself changed, so this write is not optional: apply() only reports the title.
+		save_feeds()
+		statuses[id] = { state = "ok", checked = os.time() }
+		next_at[id] = os.time() + interval()
+		notify()
+		done(nil)
+	end)
+	return true
+end
+
+
 -- Follows the feed at `input`: a feed URL, or a page whose feed its links, its platform or the usual
 -- paths lead to. Calls `cb` exactly once: with the new feed, or with an error message and why.
 function store.add(input: string, cb: (feed: Feed?, err: string?, why: AddFailure?) -> ())
@@ -1142,6 +1206,7 @@ function store.add(input: string, cb: (feed: Feed?, err: string?, why: AddFailur
 				url = final,
 				title = nonempty(parsed.title) or url.host(final),
 				site = parsed.site,
+				title_set = false,
 				favorite = false,
 				added = os.time(),
 			}

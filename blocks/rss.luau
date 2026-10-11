@@ -16,10 +16,11 @@ local span = ui.span
 type Tab = "latest" | "favorites" | "feeds"
 
 -- What the one-line field does on Enter.
-type Intent = "add" | "folder" | "rule"
+type Intent = "add" | "folder" | "rule" | "feed"
 
 -- The one-line field, and what it is for: following a feed, setting the selected feed's group, or
--- adding a filter rule. `target` is the feed id for "folder".
+-- The one-line field, and what it is for: following a feed, setting the selected feed's group,
+-- adding a filter rule, or editing a feed. `target` is the feed id for "folder" and "feed".
 type Field = {
 	text: string,
 	-- Byte offset of the caret (bytes before it).
@@ -440,6 +441,44 @@ local function paragraphs(text: string): { string }
 	return out
 end
 
+-- Splits the edit field into a title and a URL. A URL is whatever starts with a scheme, so the title
+-- is the text before it; with no URL the whole line is the title. Both come back trimmed and empty
+-- strings come back nil, which is what store.rename reads as "keep this one".
+-- Splits the edit field into a title and a URL. The URL is the text from the first `scheme://`
+-- that stands alone after a space (so `K.I.S.S` doesn't end in a fake scheme); with no URL the
+-- whole line is the title. Both come back trimmed and empty strings come back nil, which is what
+-- store.rename reads as "keep this one".
+-- Splits the edit field into a title and a URL. The URL is the text from the first `scheme://`
+-- that starts the line or follows a space, so `K.I.S.S` doesn't end in a fake scheme; with no URL
+-- the whole line is the title. Both come back trimmed and empty strings come back nil, which is
+-- what store.rename reads as "keep this one".
+-- Splits the edit field into a title and a URL. The URL is the text from the first `scheme://`
+-- that starts the line or follows a space, so the `.S` of `K.I.S.S` doesn't read as a scheme; with
+-- no URL the whole line is the title. Both come back trimmed and empty strings come back nil, which
+-- is what store.rename reads as "keep this one".
+local function split_feed_fields(text: string): (string?, string?)
+	local s = string.match(text, "^%s*(.-)%s*$") or ""
+	if s == "" then
+		return nil, nil
+	end
+	-- `^[%w+.-]+://` or `%s[%w+.-]+://`: the scheme must start the line or follow a space, so a
+	-- title ending in letters never counts as one.
+	local head = string.find(s, "^[%w+.-]+://")
+	-- In the second case the space is matched too, so the URL starts one byte later.
+	local at = head or (function()
+		local space = string.find(s, "%s[%w+.-]+://")
+		return if space then space + 1 else nil
+	end)()
+	if at == nil then
+		return s, nil
+	end
+	-- `at` is the start of the URL, or the space in front of it in the second case, and the title is
+	-- everything before that either way.
+	local title = string.match(string.sub(s, 1, at - 1), "^%s*(.-)%s*$")
+	local u = string.match(string.sub(s, at), "^%s*(.-)%s*$")
+	return if title == "" then nil else title, if u == "" then nil else u
+end
+
 -- Add field ------------------------------------------------------------------------------------------
 
 local function is_cont(b: number?): boolean
@@ -490,12 +529,12 @@ end
 -- The add field is drawn on the welcome view and the Feeds tab only.
 -- Whether the current view draws the field: the add and group fields live on the welcome view and
 -- the Feeds tab, the rule field on the latest panel.
--- Whether the view where `intent`'s field belongs is the view now: the add and group fields live on
--- the welcome view and the Feeds tab, the rule field on the Latest panel.
+-- Whether the view where `intent`'s field belongs is the view now: the add, group and feed fields
+-- live on the welcome view and the Feeds tab, the rule field on the Latest panel.
 local function field_view(state: State, intent: Intent): boolean
 	if intent == "rule" then
 		return state.panel and state.tab == "latest"
-	elseif intent == "folder" then
+	elseif intent == "folder" or intent == "feed" then
 		return state.tab == "feeds"
 	end
 	return state.tab == "feeds" or #store.feeds() == 0
@@ -541,6 +580,34 @@ local function submit_rule(state: State, cx: BlockCx, field: Field)
 	store.set_filter(cfg)
 end
 
+-- The feed field edits the selected feed: `title` and `url`. A title, a URL, or both, in that order;
+-- one field holds both, so the user sees the whole feed on one line.
+local function submit_feed(state: State, cx: BlockCx, field: Field)
+	local target = field.target
+	local text = field.text
+	if target == nil then
+		close_field(state, cx)
+		return
+	end
+	local title, u = split_feed_fields(text)
+	if title == nil and u == nil then
+		state.add_error = "Type a title, a URL, or a title and a URL in one line"
+		cx:render()
+		return
+	end
+	close_field(state, cx)
+	local ok = store.rename(target, title or "", u or "", function(err: string?)
+		if err then
+			cx:toast("error", "Couldn't read that feed", err)
+		else
+			cx:toast("success", "Updated")
+		end
+	end)
+	if not ok then
+		cx:toast("info", "Nothing to change")
+	end
+end
+
 local function submit(state: State, cx: BlockCx)
 	local field = state.adding
 	if field == nil or state.add_busy == field then
@@ -551,6 +618,9 @@ local function submit(state: State, cx: BlockCx)
 		return
 	elseif field.intent == "rule" then
 		submit_rule(state, cx, field)
+		return
+	elseif field.intent == "feed" then
+		submit_feed(state, cx, field)
 		return
 	end
 	state.add_busy = field
@@ -631,6 +701,10 @@ local function field_key(state: State, f: Field, k: Key, cx: BlockCx): boolean
 	elseif k.name == "end" then
 		f.cursor = #text
 		return true
+	elseif k.name == "space" and (k.text == nil or k.text == "") then
+		-- A space key that carries no text still types a space, so a field never silently eats it.
+		f.text = string.sub(text, 1, cursor) .. " " .. string.sub(text, cursor + 1)
+		f.cursor = cursor + 1
 	elseif k.text and k.text ~= "" and not (k.ctrl or k.meta) then
 		f.text = string.sub(text, 1, cursor) .. k.text .. string.sub(text, cursor + 1)
 		f.cursor = cursor + #k.text
@@ -817,6 +891,8 @@ local function field_prompt(f: Field): Span
 		return span("# ", "accent")
 	elseif f.intent == "rule" then
 		return span("- ", "accent")
+	elseif f.intent == "feed" then
+		return span("~ ", "accent")
 	end
 	return span("+ ", "accent")
 end
@@ -826,6 +902,8 @@ local function field_placeholder(f: Field): string
 		return "Group name, then Enter (an empty line leaves the group)"
 	elseif f.intent == "rule" then
 		return "/sponsor/ or @group /sponsor/i — hides matching posts"
+	elseif f.intent == "feed" then
+		return "Title and URL, then Enter (leave one out to keep it)"
 	end
 	return "Paste a site or feed URL, then press Enter"
 end
@@ -1576,13 +1654,19 @@ local function feeds_key(state: State, k: Key, cx: BlockCx): boolean
 	local feeds = store.feeds()
 	local feed, index = selected_feed(state, feeds)
 	local n = k.name
-	if feed and (n == "d" or n == "delete" or n == "backspace") then
+	-- `d` arms the removal and `d` again confirms. A bare backspace used to delete the feed, which is
+	-- one stray keypress away from losing a subscription while editing a field.
+	if feed and n == "d" and not k.shift then
 		remove_feed(state, feed.id)
 		return true
 	elseif feed and n == "t" and not k.shift then
 		-- `t` groups the selected feed: the field opens with its current group, empty to leave it.
 		-- Not `g`: that jumps to the top of the list.
 		open_field(state, cx, "folder", feed.folder or "", feed.id)
+		return true
+	elseif feed and n == "e" and not k.shift then
+		-- `e` edits the selected feed: its title and its URL, on one line.
+		open_field(state, cx, "feed", feed.title .. " " .. feed.url, feed.id)
 		return true
 	end
 	local had_confirm = state.confirm ~= nil

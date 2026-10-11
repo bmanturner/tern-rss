@@ -6,6 +6,8 @@ RSS and Atom feeds in a Tern block: headlines, previews, a docked reader, favori
 
 Follow feeds without leaving the terminal. The RSS block shows headlines first and opens a preview when you ask. Articles open in one Tern browser docked beside the list. Starred feeds show a toast when they post.
 
+The palette offers **Open RSS** (a block beside the focused pane) and **Open RSS in a new tab** (a block alone in a tab, full width). Both commands exist for every declared block.
+
 ## Contents
 
 - [Install](#install)
@@ -62,6 +64,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `c` | Ask Carly to find a feed after one wasn't found; `esc` dismisses |
 | `f` (Latest) | Edit the filter: read state, groups, then ordered rules |
 | `t` (Feeds) | Set the selected feed's group (`t`, since `g` jumps to the top) |
+| `e` (Feeds) | Edit the selected feed: its title and its URL, on one line. An empty line leaves both, and a new URL is checked like a new feed before it replaces the old one |
 
 ### Counts and catch-up
 

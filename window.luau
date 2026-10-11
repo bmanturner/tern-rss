@@ -22,8 +22,10 @@ local readers: { [number]: number } = {}
 local FOUND_WAIT_MS = 90000
 local FOUND_POLL_MS = 500
 
-local function open_block(cx: WindowCx, decl_id: string, title: string, args: { string }?)
-	if cx:new_block(tern.plugin.id .. "." .. decl_id, args, "beside") == nil then
+-- Opens the block `how`: beside the focused pane, or alone in a new tab. A new tab gets the whole
+-- width, which is what a reading session wants; "beside" is the sidebar the block has always used.
+local function open_block(cx: WindowCx, decl_id: string, title: string, how: How)
+	if cx:new_block(tern.plugin.id .. "." .. decl_id, nil, how) == nil then
 		cx:toast("error", title .. " is not loaded on this host", "Run `tern plugin list` to see why.")
 	end
 end
@@ -33,7 +35,14 @@ for _, decl in manifest.blocks() do
 		id = "open-" .. decl.id,
 		title = "Open " .. decl.title,
 		run = function(cx)
-			open_block(cx, decl.id, decl.title, nil)
+			open_block(cx, decl.id, decl.title, "beside")
+		end,
+	})
+	tern.command({
+		id = "open-" .. decl.id .. "-tab",
+		title = "Open " .. decl.title .. " in a new tab",
+		run = function(cx)
+			open_block(cx, decl.id, decl.title, "tab")
 		end,
 	})
 end
