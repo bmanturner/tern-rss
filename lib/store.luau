@@ -10,6 +10,7 @@ local url = require("./url")
 local config = require("./config")
 local poll = require("./poll")
 local carly = require("./carly")
+local filter = require("./filter")
 
 local store = {}
 
@@ -19,6 +20,8 @@ export type Feed = {
 	url: string,
 	title: string,
 	site: string?,
+	-- The subscription group the user put it in; nil or "" is ungrouped.
+	folder: string?,
 	favorite: boolean,
 	added: number,
 	seen_until: number?,
@@ -84,11 +87,14 @@ local cfg = config.for_block("rss", { refresh_minutes = 15 })
 local DIR = tern.plugin.data .. "/rss"
 local FEEDS_PATH = DIR .. "/feeds.json"
 local READ_PATH = DIR .. "/read.json"
+local FILTER_PATH = DIR .. "/filters.json"
 
 local loaded = false
 local dir_ready = false
 local feeds_list: { Feed } = {}
 local read_map: { [string]: number } = {}
+-- The Latest tab's filter, shared by every RSS block (see lib/filter).
+local filter_cfg: filter.Config = filter.empty()
 local caches: { [string]: Cache } = {}
 local statuses: { [string]: Status } = {}
 local next_at: { [string]: number } = {}
@@ -219,6 +225,11 @@ local function save_feeds()
 	write_json(FEEDS_PATH, { version = 1, feeds = tern.json.array(table.clone(feeds_list)) })
 end
 
+-- Rule lines, so filters.json stays readable and hand-editable.
+local function save_filter()
+	write_json(FILTER_PATH, filter.encode(filter_cfg))
+end
+
 local function save_cache(id: string, c: Cache)
 	write_json(cache_path(id), {
 		title = c.title,
@@ -260,6 +271,7 @@ local function parse_feed_record(v: any): Feed?
 		url = u,
 		title = nonempty(opt_string(v.title)) or url.host(u),
 		site = opt_string(v.site),
+		folder = nonempty(opt_string(v.folder)),
 		favorite = v.favorite == true,
 		added = opt_number(v.added) or os.time(),
 		seen_until = opt_number(v.seen_until),
@@ -343,6 +355,34 @@ local function load_read()
 	end
 end
 
+-- The Latest tab's filter. A file that doesn't decode is kept aside, like feeds.json.
+local function load_filter()
+	local text = read_file(FILTER_PATH)
+	if not text then
+		return
+	end
+	local data = decode(text)
+	if type(data) ~= "table" then
+		write_text(FILTER_PATH .. ".bad", text)
+		tern.log.warn("tern-rss store: filters.json unreadable; saved as filters.json.bad")
+		return
+	end
+	local cfg, bad = filter.decode(data)
+	filter_cfg = cfg
+	if bad > 0 then
+		tern.log.warn(`tern-rss store: {bad} filter rule(s) in filters.json didn't parse; dropped`)
+	end
+end
+
+-- The group names the subscribed feeds carry, for the filter panel and the tree.
+local function folder_set(): { [string]: boolean }
+	local out: { [string]: boolean } = {}
+	for _, f in feeds_list do
+		out[filter.group(f)] = true
+	end
+	return out
+end
+
 local start_carly_poll: () -> ()
 
 -- Resumes Carly searches a reload interrupted and drops leftovers of finished ones.
@@ -387,6 +427,7 @@ local function ensure_loaded()
 	loaded = true
 	load_feeds()
 	load_read()
+	load_filter()
 	local iv = interval()
 	for _, f in feeds_list do
 		last_stamp = math.max(last_stamp, f.seen_until or 0)
@@ -851,6 +892,80 @@ function store.restore_seen(prev: { [string]: number | false })
 		end
 	end
 	save_feeds()
+	-- A group whose last feed just left stops hiding posts in the filter.
+	if filter.prune(filter_cfg, folder_set()) then
+		save_filter()
+	end
+	notify()
+end
+
+-- Groups and filters --------------------------------------------------------------------------------
+
+-- The folders the subscribed feeds carry, sorted, ungrouped last: the tree's and the panel's order.
+function store.folders(): { string }
+	ensure_loaded()
+	local seen: { [string]: boolean } = {}
+	local out: { string } = {}
+	for _, f in feeds_list do
+		local g = filter.group(f)
+		if not seen[g] then
+			seen[g] = true
+			table.insert(out, g)
+		end
+	end
+	table.sort(out, function(a: string, b: string): boolean
+		local a_ungrouped = a == filter.UNGROUPED
+		local b_ungrouped = b == filter.UNGROUPED
+		if a_ungrouped ~= b_ungrouped then
+			return b_ungrouped
+		end
+		return a < b
+	end)
+	return out
+end
+
+-- The subscribed feeds in `folder`, in subscription order.
+function store.feeds_in(folder: string): { Feed }
+	ensure_loaded()
+	local out: { Feed } = {}
+	for _, f in feeds_list do
+		if filter.group(f) == folder then
+			table.insert(out, f)
+		end
+	end
+	return out
+end
+
+-- Puts `id` in folder `name`; nil or "" clears it. The name is the user's text, trimmed.
+function store.set_folder(id: string, name: string?)
+	ensure_loaded()
+	local f = find(id)
+	if not f then
+		return
+	end
+	local want = string.match(name or "", "^%s*(.-)%s*$") or ""
+	local g: string? = if want == "" then nil else string.sub(want, 1, 60)
+	if f.folder == g then
+		return
+	end
+	f.folder = g
+	save_feeds()
+	if filter.prune(filter_cfg, folder_set()) then
+		save_filter()
+	end
+	notify()
+end
+
+-- The Latest tab's filter, shared by every RSS block in this host.
+function store.filter(): filter.Config
+	ensure_loaded()
+	return filter_cfg
+end
+
+function store.set_filter(cfg: filter.Config)
+	ensure_loaded()
+	filter_cfg = cfg
+	save_filter()
 	notify()
 end
 
