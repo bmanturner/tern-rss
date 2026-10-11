@@ -206,17 +206,6 @@ local function selected_feed(state: State, feeds: { store.Feed }): (store.Feed?,
 end
 
 -- The row index of the remembered selection, or 1 when it is gone (selected_item's fallback).
-local function selected_index(state: State, rows: { store.Item }): number
-	local key = sel_key(state)
-	for i, it in rows do
-		if it.key == key then
-			return i
-		end
-	end
-	local at = if state.tab == "favorites" then state.sel_at.favorites else state.sel_at.latest
-	return math.clamp(at, 1, math.max(1, #rows))
-end
-
 local function find_item(key: string): store.Item?
 	for _, it in store.items() do
 		if it.key == key then
@@ -802,6 +791,14 @@ local function follow_starter(state: State, cx: BlockCx, i: number)
 	end)
 end
 
+-- Opens `link` for reading. The native reader block (blocks/reader.luau) is the default: it fetches
+-- the page itself and draws its text and images, so Tern's browser stays for what the extractor
+-- cannot read. The reader keeps its own state per instance, and the window reuses one instance per
+-- RSS pane, so a second article lands in the same reading pane.
+local function open_article(cx: BlockCx, link: string)
+	cx:open("tern-rss://read/" .. cx.pane .. "?url=" .. url.encode(link))
+end
+
 local function visit(cx: BlockCx, item: store.Item)
 	local link = item.link
 	if link == nil then
@@ -809,7 +806,7 @@ local function visit(cx: BlockCx, item: store.Item)
 		return
 	end
 	store.set_read(item.key, true)
-	cx:open("tern-rss://read/" .. cx.pane .. "?url=" .. url.encode(link))
+	open_article(cx, link)
 end
 
 local function toggle_read(item: store.Item)
@@ -1094,28 +1091,19 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node })
 	if sel and sel.key ~= sel_key(state) then
 		set_sel(state, sel.key)
 	end
-	-- How many rows the pane can actually hold. Drawing more pushes the dock (and the whole block
-	-- below the pane) out of view, so the list carries a window around the selection instead.
-	-- A row is one terminal line plus ~6px, so more rows fit the taller the pane is. Two rows of
-	-- slack stay free at the bottom: a window whose last lines sit off screen still shows the dock.
-	-- `bars` covers the tab strip, the filter line, the "N older" line and the dock's own line, plus
-	-- two lines of daylight so the dock's descenders stay off the pane's bottom edge.
+	-- The list scrolls itself: `max = { lines }` caps its height and keeps the selection in view, so
+	-- every row is drawn and the list owns the window. `bars` is what surrounds it (tab strip, filter
+	-- line, the tab's own note, the dock), plus two lines of daylight so the dock clears the edge.
 	local bars = 8 + (if state.tab == "latest" then 1 else 0) + (if state.preview then 8 else 0)
 	local cap = math.max(4, rows_fitting(cx.rows - bars, 4))
-	local start, last = 1, #rows
-	if #rows > cap then
-		local sel_index = selected_index(state, rows)
-		start = math.clamp(sel_index - math.floor(cap / 2), 1, #rows - cap + 1)
-		last = start + cap - 1
-	end
 	local now = os.time()
 	-- The divider sits where the user last caught up: under the new posts, or on top when none are new.
 	local caught = caught_up_at(state.tab)
-	local divider_before = if caught and n_new >= start and n_new < last then n_new + 1 else nil
+	local divider_before = if caught then n_new + 1 else nil
 	-- Narrow panes squeeze the feed name to "…" fragments: drop it there and mark favorites in the label.
 	local narrow = cx.cols < 90
 	local children: { Node } = {}
-	for i = start, last do
+	for i = 1, #rows do
 		local it = rows[i]
 		if i == divider_before and caught then
 			table.insert(children, cards.with(ui.rule("caught up " .. fmt.ago(caught, now)), { key = "caught-up" }))
@@ -1153,24 +1141,16 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node })
 		ui.node("list", {
 			key = "items",
 			selected = if sel then "main.items." .. sel.key else nil,
-			-- The window already holds at most this many rows; the prop keeps the selection in view.
+			-- The list caps its own height and scrolls, keeping the selection in view.
 			max = { lines = cap },
 		}, children)
 	)
-	-- What the window left out: above the drawn rows, below them, and past MAX_ROWS.
-	local above, below = start - 1, #rows - last + hidden
-	if above > 0 or below > 0 then
-		local out: { Span | string } = {}
-		if above > 0 then
-			table.insert(out, span("↑ " .. plural(above, "headline", "headlines"), "muted"))
-		end
-		if above > 0 and below > 0 then
-			table.insert(out, span(" · ", "muted"))
-		end
-		if below > 0 then
-			table.insert(out, span("↓ " .. plural(below, "headline", "headlines"), "muted"))
-		end
-		table.insert(parts, cards.with(ui.text(out), { key = "more" }))
+	-- Posts past the row cap: the list scrolls the drawn rows itself, so only this note is left.
+	if hidden > 0 then
+		table.insert(
+			parts,
+			cards.with(ui.text({ span("↓ " .. plural(hidden, "headline", "headlines") .. " not shown", "muted") }), { key = "more" })
+		)
 	end
 end
 

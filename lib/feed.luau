@@ -958,4 +958,167 @@ function feed.date(s: string): number?
 	return after_epoch(fmt.utc(year, month, num(rd), num(rh), num(rmi), num(rs)) - offset)
 end
 
+--------------------------------------------------------------------------------------------------
+-- Article extraction (the native reader)
+--
+-- Turns an HTML page into interleaved Markdown and image blocks a reader block draws in order.
+-- This is deliberately not a readability algorithm -- it takes the container with the most
+-- paragraph text and walks its tags. A page that defeats it falls back to Tern's browser, which
+-- is why this runs best-effort.
+
+-- One block of the article, in document order: a run of text drawn as Markdown, or one image.
+export type ArticleBlock = {
+	-- "md" draws `text` with the view's Markdown renderer; "img" draws `src`.
+	kind: "md" | "img",
+	text: string?,
+	src: string?,
+	alt: string?,
+	-- Natural width and height from the <img> attributes, when declared: the view sizes the
+	-- image from them instead of jumping when the bytes arrive.
+	w: number?,
+	h: number?,
+}
+export type Article = { blocks: { ArticleBlock }, text: string }
+
+-- The largest HTML prefix the extractor reads; beyond it the browser is the honest answer.
+local ARTICLE_SOURCE_MAX = 1_500_000
+-- Beyond this many characters of extracted text the article is truncated (about 40 screens).
+local ARTICLE_TEXT_MAX = 120_000
+-- At most this many images ship with one article.
+local ARTICLE_IMAGES_MAX = 12
+
+-- The container whose direct paragraph text is longest, named by tag: the reader reads that one.
+local function article_container(html: string): (string, string, string)
+	local best_kind, best_src, best_text = "body", html, ""
+	for _, kind in { "article", "main", "content", "post", "body" } do
+		local open_pat = `<` .. kind .. `[%s>][^>]*>`
+		local open = string.find(html, open_pat)
+		if open then
+			local gt = string.find(html, ">", open, true) or open
+			local close_pat = `</` .. kind:lower() .. `>`
+			local close = string.find(html:lower(), close_pat, gt, true)
+			local inner = string.sub(html, gt + 1, if close then close - 1 else #html)
+			local text = html_to_text(inner)
+			if #text > #best_text and #text > 400 then
+				best_kind, best_src, best_text = kind, inner, text
+			end
+		end
+	end
+	return best_kind, best_src, best_text
+end
+
+-- Tag names that break a text run, and what they leave behind. `<br>` and `<li>` key their opening
+-- form, the rest their closing form.
+local BREAKS_HTML: { [string]: string } = {
+	["<br"] = "\n",
+	["</p"] = "\n\n",
+	["</div"] = "\n",
+	["</li"] = "\n",
+	["</h1"] = "\n\n",
+	["</h2"] = "\n\n",
+	["</h3"] = "\n\n",
+	["</h4"] = "\n\n",
+	["</h5"] = "\n\n",
+	["</h6"] = "\n\n",
+	["</blockquote"] = "\n\n",
+	["</tr"] = "\n",
+}
+
+-- The article in `body` (an HTML page), read for the native reader: the container's content as
+-- interleaved Markdown and image blocks, in document order, plus the whole text for the "is there
+-- anything here" check. `blocks` is empty when nothing useful came out, and the caller falls back
+-- to the browser. The walk is the preview's html_to_text with two differences: <img> becomes an
+-- image block instead of vanishing, and headings become Markdown `#` lines so ui.md draws the
+-- structure. Linear: every "<" and ">" is searched for once.
+function feed.article(body: string, base: string): Article
+	local html = if #body > ARTICLE_SOURCE_MAX then string.sub(body, 1, ARTICLE_SOURCE_MAX) else body
+	local _kind, inner = article_container(html)
+	if inner == "" then
+		return { blocks = {}, text = "" }
+	end
+	local blocks: { ArticleBlock } = {}
+	local buf: { string } = {}
+	local images = 0
+
+	local function flush()
+		local md = tidy(decode_entities(table.concat(buf)))
+		buf = {}
+		if md ~= "" then
+			table.insert(blocks, { kind = "md", text = md })
+		end
+	end
+
+	local pos = 1
+	while true do
+		local lt = string.find(inner, "<", pos, true)
+		if lt == nil then
+			table.insert(buf, string.sub(inner, pos))
+			break
+		end
+		if lt > pos then
+			table.insert(buf, string.sub(inner, pos, lt - 1))
+		end
+		local gt = string.find(inner, ">", lt, true)
+		if gt == nil then -- a half tag at the source cap: the rest is text
+			table.insert(buf, string.sub(inner, lt))
+			break
+		end
+		pos = gt + 1
+		local raw = string.sub(inner, lt + 1, gt - 1)
+		-- Both captures matter: the slash (a closing tag) and the name. Taking one value here was a
+		-- bug -- `name` held only the slash, so no tag was ever recognized.
+		local slash, bare = string.match(string.lower(raw), "^%s*(/?)%s*([%a%-]+)")
+		if bare == nil then
+			continue
+		end
+		local closing = slash == "/"
+		if not closing and (bare == "script" or bare == "style") then
+			local close = string.find(inner:lower(), "</" .. bare, gt, true)
+			pos = if close then select(2, string.find(inner, ">", close, true)) + 1 else gt + 1
+		elseif bare == "img" and not closing then
+			images += 1
+			if images <= ARTICLE_IMAGES_MAX then
+				local attrs = decode_attrs("<" .. raw .. ">", true)
+				local src = attrs.src
+				if src and src ~= "" and string.sub(src, 1, 5) ~= "data:" then
+					flush()
+					table.insert(blocks, {
+						kind = "img",
+						src = url.resolve(base, src),
+						alt = collapse(attrs.alt or ""),
+						w = tonumber(attrs.width),
+						h = tonumber(attrs.height),
+					})
+				end
+			end
+		else
+			local left = BREAKS_HTML["<" .. bare]
+			local right = BREAKS_HTML["</" .. bare]
+			if bare == "li" then
+				-- A list item is Markdown's "- ", on its own line, so ui.md draws a real list.
+				table.insert(buf, if closing then "\n" else "\n- ")
+			elseif not closing and left then
+				table.insert(buf, left)
+			elseif closing and right then
+				flush()
+				table.insert(buf, right)
+			elseif not closing and string.match(bare, "^h[1-6]$") then
+				flush()
+				table.insert(buf, string.rep("#", tonumber(string.sub(bare, 2, 2)) :: number) .. " ")
+			end
+		end
+	end
+	flush()
+
+	local text_parts: { string } = {}
+	for _, b in blocks do
+		table.insert(text_parts, if b.kind == "md" then (b.text :: string) else (b.alt or "image"))
+	end
+	local text = table.concat(text_parts, "\n")
+	if #text > ARTICLE_TEXT_MAX then
+		text = string.sub(text, 1, ARTICLE_TEXT_MAX) .. "\n\n\u{2026}"
+	end
+	return { blocks = blocks, text = text }
+end
+
 return feed

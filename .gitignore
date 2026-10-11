@@ -1,3 +1,5 @@
 .DS_Store
 .impeccable/
 tern.d.luau
+target/
+.omp/

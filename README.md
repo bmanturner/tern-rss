@@ -4,7 +4,7 @@ RSS and Atom feeds in a Tern block: headlines, previews, a docked reader, favori
 
 ![The Latest tab: new posts marked with dots, read posts dimmed, and a preview card open under the selected headline](docs/latest.png)
 
-Follow feeds without leaving the terminal. The RSS block shows headlines first and opens a preview when you ask. Articles open in one Tern browser docked beside the list. Starred feeds show a toast when they post.
+Follow feeds without leaving the terminal. The RSS block shows headlines first and opens a preview when you ask. Articles open in one native reader block docked beside the list: its text and its images are drawn in place. Starred feeds show a toast when they post.
 
 The palette offers **Open RSS** (a block beside the focused pane) and **Open RSS in a new tab** (a block alone in a tab, full width). Both commands exist for every declared block.
 
@@ -43,7 +43,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | ★ Favorites | Headlines from starred feeds only. The filter doesn't apply here. |
 | Feeds | Your subscriptions with new-post counts and refresh errors, plus sites Carly is still searching. Star, catch up, group, remove and add feeds here; grouped feeds sit under a header row. |
 
-![The Favorites tab beside the docked reader browser, which shows an open article](docs/reader.png)
+![The Favorites tab beside the docked reader, which draws an article's text and images in place](docs/reader.png)
 
 ### Keys
 
@@ -52,7 +52,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `1` `2` `3`, `tab` / `shift+tab` | Switch tabs |
 | `j` `k`, arrows, `g` `G`, `page_up` `page_down` | Move |
 | `space` (`→` / `←` to show / hide) | Toggle the preview under the selected headline |
-| `enter` or `o` | Open the article in the reader browser beside the block (marks it read) |
+| `enter` or `o` | Open the article in the reader block beside the list; one pane reads every article in place (marks it read) |
 | `m` | Mark one post read / unread |
 | `shift+r` | Mark the posts this tab shows read, or unread when they all already are |
 | `shift+m` | Catch up: everything in this tab (on Feeds, the selected feed) stops being new |
@@ -182,7 +182,7 @@ The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filte
 
 ## Privacy
 
-- **Network:** the plugin fetches the feed URLs you follow. While you add a site, it also fetches candidate feed URLs on that site's host and links the page itself points to. Candidates on loopback or private-network addresses are skipped unless the URL you pasted is itself local. Articles you open load in Tern's browser.
+- **Network:** the plugin fetches the feed URLs you follow. While you add a site, it also fetches candidate feed URLs on that site's host and links the page itself points to. Candidates on loopback or private-network addresses are skipped unless the URL you pasted is itself local. Articles you open are fetched and drawn by the reader block; a page it cannot extract opens in Tern's browser instead.
 - **Carly:** asked only when you choose "Ask Carly to find it".
 - **Nothing else:** no telemetry, no accounts, no sync.
 
@@ -200,7 +200,7 @@ The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filte
 ## Requirements
 
 - Developed and tested on Tern 0.6.1, desktop.
-- Uses Carly exports and `ask_carly` (for the optional, ask-first feed search) and the browser API (for the docked reader).
+- Uses Carly exports and `ask_carly` (for the optional, ask-first feed search). The browser API is a fallback for pages the native reader cannot extract.
 - The plugin's host half runs where the panes run. To use the RSS block in a pane on a remote host, install the plugin on that host too, following Tern's remote-host rules.
 
 ## Uninstall
@@ -229,8 +229,9 @@ Logs: `~/Library/Logs/Tern/tern-daemon.log` (host half: the block, store, pollin
 ```text
 plugin.toml            manifest
 host.luau              block registry (host half)
-window.luau            palette commands, reader route, Carly route and exports (window half)
+window.luau            palette commands, reader route and pane reuse, Carly route (window half)
 blocks/rss.luau        the RSS block; returns its BlockDef
+blocks/reader.luau     the native reader block: text and images in document order (host half)
 lib/manifest.luau      reads [[blocks]] id/title from plugin.toml      (both halves)
 lib/config.luau        typed per-block config over tern.kv             (both halves)
 lib/cards.luau         error card + props helper                       (both halves)

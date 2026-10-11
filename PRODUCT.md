@@ -14,11 +14,11 @@ Public Tern users: developers who live in the Tern terminal and want to follow R
 
 ## Product Purpose
 
-Follow RSS/Atom feeds in a native Tern block. Headlines come first, previews open on demand, articles open in Tern's own browser block, and favorite feeds announce new posts with a toast. Success: a user subscribes in seconds, scans what is new at a glance, and never loses their place.
+Follow RSS/Atom feeds in a native Tern block. Headlines come first, previews open on demand, articles are read in a native reader block that draws text and images in place, and favorite feeds announce new posts with a toast. Success: a user subscribes in seconds, scans what is new at a glance, and never loses their place.
 
 ## Positioning
 
-Lives inside Tern as a block. Reading happens in one Tern browser block docked beside the list and reused for every article, so the list stays put while you read.
+Lives inside Tern as a block. Reading happens in one native reader block docked beside the list, reused for every article (its text and images drawn in document order), so the list stays put while you read. A page the extractor cannot read falls back to Tern's browser.
 
 ## Operating Context
 
