@@ -52,6 +52,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `space` (`→` / `←` to show / hide) | Toggle the preview under the selected headline |
 | `enter` or `o` | Open the article in the reader browser beside the block (marks it read) |
 | `m` | Mark one post read / unread |
+| `shift+r` | Mark the posts this tab shows read, or unread when they all already are |
 | `shift+m` | Catch up: everything in this tab (on Feeds, the selected feed) stops being new |
 | `u` | Undo the last catch-up (until you switch tabs) |
 | `s` (Feeds) | Star a feed: its new posts show a toast |
@@ -59,7 +60,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `a`, or paste a URL | Add a feed |
 | `r` | Refresh every feed now |
 | `c` | Ask Carly to find a feed after one wasn't found; `esc` dismisses |
-| `f` (Latest) | Edit the filter: groups, then ordered rules |
+| `f` (Latest) | Edit the filter: read state, groups, then ordered rules |
 | `t` (Feeds) | Set the selected feed's group (`t`, since `g` jumps to the top) |
 
 ### Counts and catch-up
@@ -86,12 +87,13 @@ Unreachable hosts and bad addresses show their error under the add field. When t
 
 A feed's group is one line of text; a feed with none is ungrouped. On Feeds, `t` opens a one-line field with the selected feed's group in it: Enter assigns it, an empty line leaves the group, and a name that isn't taken yet makes a new group. Once any feed is grouped, the Feeds list draws a header row per group and nests that group's feeds under it. Header rows aren't selectable, so selection stays on feed ids. Groups come from the feeds themselves: remove the last feed of a group and the group goes with it.
 
-The filter narrows Latest. `f` opens it, and `esc` or `f` closes it. It is a group gate plus an ordered list of rules, and a status line above the headlines always shows what it is doing, with the Latest tab counting only the posts the filter shows:
+The filter narrows Latest. `f` opens it, and `esc` or `f` closes it. It is a read-state gate, a group gate and an ordered list of rules. A status line above the headlines always shows what it is doing, with the Latest tab counting only the posts the filter shows:
 
 ```text
 Filter 1 group in · 1 rule · 4 posts hidden   f edit
 ```
 
+- **Read state.** The first row steps through every post, unread only, and read only with `space` or `x`. This is a hard gate: it decides before the groups and the rules do, so "unread only" means unread.
 - **Groups.** One row per group, plus an "Every group" row. `space` checks the group under the cursor; the checked groups are a whitelist, and with nothing checked every group is in. `x` excludes a group, which always loses; a group is never both checked and excluded. `space` on "Every group" unchecks every group, which is the same as "all".
 - **Rules.** Rows are numbered in the order they are read, each shown as `<n> drop|keep <pattern>  <scope>`. `a` adds a rule (the field opens prefilled with the group under the cursor, when there is one), `d` deletes the selected rule, and `K` / `J` move it up or down in that order. `j` / `k` and the arrows move the cursor.
 
@@ -131,10 +133,10 @@ The value is re-read before each refresh and shared by all RSS blocks.
 The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filters.json` in the plugin data directory, where it is hand-editable:
 
 ```json
-{"version":1,"groups":{"tech":true},"excluded":{},"rules":["f:\"Rust Weekly\" keep .","all drop [Ss]ponsor"]}
+{"version":1,"read":"all","groups":{"tech":true},"excluded":{},"rules":["f:\"Rust Weekly\" keep .","all drop [Ss]ponsor"]}
 ```
 
-`groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter is off; a rule line that doesn't parse is dropped, with a warning in the log. The filter is shared by every RSS block in this host, like the feed list.
+`read` is `all`, `unread` or `read`, `groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter is off; a rule line that doesn't parse is dropped, with a warning in the log. The filter is shared by every RSS block in this host, like the feed list.
 
 ## Privacy
 

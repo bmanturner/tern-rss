@@ -840,6 +840,30 @@ function store.set_read(key: string, read: boolean)
 	notify()
 end
 
+-- Marks `keys` in one write and one notify, so marking a list of posts is not one save each.
+-- Returns how many changed.
+function store.set_read_many(keys: { string }, read: boolean): number
+	ensure_loaded()
+	local n = 0
+	local now = os.time()
+	for _, key in keys do
+		if read then
+			if read_map[key] == nil then
+				read_map[key] = now
+				n += 1
+			end
+		elseif read_map[key] ~= nil then
+			read_map[key] = nil
+			n += 1
+		end
+	end
+	if n > 0 then
+		save_read_soon()
+		notify()
+	end
+	return n
+end
+
 -- Whether `item` arrived after its feed was last caught up on.
 function store.is_new(item: Item): boolean
 	local f = find(item.feed)

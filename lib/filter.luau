@@ -16,12 +16,16 @@ local filter = {}
 export type Scope = { kind: "all" } | { kind: "group", name: string } | { kind: "feed", key: string }
 -- A rule as the user typed it; `raw` is kept so the panel shows the line back.
 export type Rule = { scope: Scope, drop: boolean, pat: string, raw: string }
+-- Which posts the read state lets through.
+export type ReadState = "all" | "unread" | "read"
 export type Config = {
 	-- Included groups, a whitelist; empty means every group. `filter.UNGROUPED` is the feeds
 	-- without a folder.
 	groups: { [string]: boolean },
 	-- Excluded groups, which always lose.
 	excluded: { [string]: boolean },
+	-- The read gate: a hard gate, applied before the rules.
+	read: ReadState,
 	-- In order; the first match decides.
 	rules: { Rule },
 }
@@ -29,7 +33,23 @@ export type Config = {
 filter.UNGROUPED = ""
 
 function filter.empty(): Config
-	return { groups = {}, excluded = {}, rules = {} }
+	return { groups = {}, excluded = {}, read = "all", rules = {} }
+end
+
+-- The read states the panel offers, in order.
+-- The read states the panel steps through, in order. Declared as a local so the field keeps the
+-- type: a module field cannot carry an annotation of its own.
+local READ_STATES: { ReadState } = { "all", "unread", "read" }
+filter.READ_STATES = READ_STATES
+
+-- The state after `state` in the cycle.
+function filter.next_read(state: ReadState): ReadState
+	for i, s in READ_STATES do
+		if s == state then
+			return READ_STATES[i % #READ_STATES + 1]
+		end
+	end
+	return "all"
 end
 
 local SPACE: { [number]: boolean } = { [9] = true, [10] = true, [11] = true, [12] = true, [13] = true, [32] = true }
@@ -218,7 +238,14 @@ function filter.group_allows(cfg: Config, folder: string): boolean
 end
 
 -- Whether a post is shown. `feed` is its feed, when the store still knows it.
-function filter.visible(cfg: Config, item: { title: string, preview: string? }, feed: any): boolean
+-- Whether a post is shown. `feed` is its feed, when the store still knows it, and `read` its read
+-- state. The read gate is absolute: it decides before any rule does, so "Unread" means unread.
+function filter.visible(cfg: Config, item: { title: string, preview: string? }, feed: any, read: boolean): boolean
+	if cfg.read == "unread" and read then
+		return false
+	elseif cfg.read == "read" and not read then
+		return false
+	end
 	local text: string? = nil
 	for _, r in cfg.rules do
 		if in_scope(r.scope, feed) then
@@ -235,7 +262,7 @@ end
 
 -- Whether the filter changes anything.
 function filter.active(cfg: Config): boolean
-	return next(cfg.groups) ~= nil or next(cfg.excluded) ~= nil or #cfg.rules > 0
+	return next(cfg.groups) ~= nil or next(cfg.excluded) ~= nil or cfg.read ~= "all" or #cfg.rules > 0
 end
 
 -- Drops group names that no feed carries any more, so a checkmark for a group the user removed
@@ -263,7 +290,7 @@ function filter.encode(cfg: Config): { [string]: any }
 	for _, r in cfg.rules do
 		table.insert(rules, r.raw)
 	end
-	return { version = 1, groups = cfg.groups, excluded = cfg.excluded, rules = rules }
+	return { version = 1, groups = cfg.groups, excluded = cfg.excluded, read = cfg.read, rules = rules }
 end
 
 -- The config in `v`, and how many stored rule lines no longer parse.
@@ -285,6 +312,11 @@ function filter.decode(v: any): (Config, number)
 	end
 	cfg.groups = names(v.groups)
 	cfg.excluded = names(v.excluded)
+	for _, state in filter.READ_STATES do
+		if v.read == state then
+			cfg.read = state
+		end
+	end
 	local bad = 0
 	if type(v.rules) == "table" then
 		for _, line in ipairs(v.rules) do

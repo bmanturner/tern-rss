@@ -120,7 +120,7 @@ local function headlines(tab: Tab): ({ store.Item }, number, number)
 	local filtered = tab == "latest" and filter.active(cfg)
 	for _, it in store.items() do
 		if tab ~= "favorites" or is_favorite(it) then
-			if not filtered or filter.visible(cfg, it, store.feed(it.feed)) then
+			if not filtered or filter.visible(cfg, it, store.feed(it.feed), store.is_read(it.key)) then
 				if store.is_new(it) then
 					table.insert(fresh, it)
 				else
@@ -149,7 +149,7 @@ local function hidden_count(): number
 	end
 	local n = 0
 	for _, it in store.items() do
-		if not filter.visible(cfg, it, store.feed(it.feed)) then
+		if not filter.visible(cfg, it, store.feed(it.feed), store.is_read(it.key)) then
 			n += 1
 		end
 	end
@@ -225,21 +225,23 @@ local function find_item(key: string): store.Item?
 	return nil
 end
 
--- New unread posts: all, favorite feeds only, and per feed id.
 -- Filter panel --------------------------------------------------------------------------------------
 --
--- The Latest tab's filter editor: the all-groups row, then one row per subscription group, then one
--- per rule in the order the rules are read. panel_rows is the one source of that order, shared by
--- the view and the keys, so a key always acts on the row under the cursor.
+-- The Latest tab's filter editor: the read-state row, then the all-groups row, one row per
+-- subscription group, then one per rule in the order the rules are read. panel_rows is the one
+-- source of that order, shared by the view and the keys, so a key always acts on the row under the
+-- cursor.
 
 -- Which kind of row a panel line is.
-type RowKind = "all" | "group" | "rule"
+type RowKind = "read" | "all" | "group" | "rule"
 
--- A panel row: the all-groups row, group `name`, or rule `index` (1-based).
 type PanelRow = { kind: RowKind, name: string?, index: number? }
 
 local function panel_rows(): { PanelRow }
-	local rows: { PanelRow } = { { kind = "all", name = nil, index = nil } }
+	local rows: { PanelRow } = {
+		{ kind = "read", name = nil, index = nil },
+		{ kind = "all", name = nil, index = nil },
+	}
 	for _, name in store.folders() do
 		table.insert(rows, { kind = "group", name = name, index = nil })
 	end
@@ -259,6 +261,9 @@ local function describe_filter(cfg: filter.Config): string
 		excluded += 1
 	end
 	local out: { string } = {}
+	if cfg.read ~= "all" then
+		table.insert(out, cfg.read .. " only")
+	end
 	if groups > 0 then
 		table.insert(out, plural(groups, "group", "groups") .. " in")
 	end
@@ -273,10 +278,18 @@ end
 
 -- Space checks a group, `x` excludes it. Checking a group is what keeps it in the Latest tab; with
 -- nothing checked every group is in. A group is never both, and space on the top row unchecks all.
+-- Space checks a group, `x` excludes it. Checking a group is what keeps it in the Latest tab; with
+-- nothing checked every group is in. A group is never both, and space on the all-groups row unchecks
+-- them all. The read row steps a single cycle instead: every post, unread only, read only.
 local function panel_toggle(row: PanelRow, pressed: string): boolean
 	local cfg = store.filter()
 	local name = row.name
-	if row.kind == "all" and pressed == "space" then
+	if row.kind == "read" then
+		if pressed ~= "space" and pressed ~= "x" then
+			return false
+		end
+		cfg.read = filter.next_read(cfg.read)
+	elseif row.kind == "all" and pressed == "space" then
 		if next(cfg.groups) == nil then
 			return false
 		end
@@ -350,7 +363,7 @@ local function tally(): (number, { [string]: number }, number)
 			if is_favorite(it) then
 				fav += 1
 			end
-			if not filtered or filter.visible(cfg, it, store.feed(it.feed)) then
+			if not filtered or filter.visible(cfg, it, store.feed(it.feed), store.is_read(it.key)) then
 				shown += 1
 			end
 		end
@@ -729,6 +742,25 @@ local function toggle_read(item: store.Item)
 	store.set_read(item.key, not store.is_read(item.key))
 end
 
+-- Marks every post the tab shows read, or unread when they all already are, in one write. This is
+-- what follows a read filter: narrow Latest to unread, then clear the list with one key.
+local function toggle_all_read(state: State): boolean
+	local rows = headlines(state.tab)
+	if #rows == 0 then
+		return false
+	end
+	local keys: { string } = {}
+	local all_read = true
+	for _, it in rows do
+		table.insert(keys, it.key)
+		if not store.is_read(it.key) then
+			all_read = false
+		end
+	end
+	store.set_read_many(keys, not all_read)
+	return true
+end
+
 -- First call arms, second removes; the selection moves to the next feed, else the previous one.
 local function remove_feed(state: State, id: string)
 	if state.confirm ~= id then
@@ -956,7 +988,8 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node })
 		if hid > 0 then
 			table.insert(spans, span(" · " .. plural(hid, "post", "posts") .. " hidden", "muted"))
 		end
-		table.insert(spans, span("   f", "key"))
+		table.insert(spans, span("   "))
+		table.insert(spans, span("f", "key"))
 		table.insert(spans, span(" edit", "muted"))
 		table.insert(parts, cards.with(ui.text(spans), { key = "filter-bar", actions = { click = "filter-open" } }))
 	end
@@ -1063,8 +1096,8 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node })
 	end
 end
 
--- The Latest tab's filter editor: the group gate, then the ordered rules. Rows come from
--- panel_rows, so the cursor and the view never disagree about which row is under it.
+-- The Latest tab's filter editor: the read gate, the group gate, then the ordered rules. Rows
+-- come from panel_rows, so the cursor and the view never disagree about which row is under it.
 local function panel_view(state: State, cx: BlockCx, parts: { Node })
 	local cfg = store.filter()
 	local rows = panel_rows()
@@ -1075,7 +1108,8 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node })
 			ui.text({
 				span("Filter ", "strong"),
 				span("Latest", "accent"),
-				span("   esc", "key"),
+				span("   "),
+				span("esc", "key"),
 				span(" close", "muted"),
 			}),
 			{ key = "filter-head" }
@@ -1084,7 +1118,22 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node })
 	local children: { Node } = {}
 	local keys: { string } = {}
 	for i, row in rows do
-		if row.kind == "all" then
+		if row.kind == "read" then
+			table.insert(keys, "read")
+			table.insert(
+				children,
+				ui.node("item", {
+					key = "read",
+					label = {
+						span(if cfg.read == "all" then "☑" else "☐", if cfg.read == "all" then "accent" else "muted"),
+						span(" "),
+						span("Every post", "strong"),
+					},
+					detail = if cfg.read == "all" then "space shows unread only" else cfg.read .. " only",
+					value = { span("space · x", "muted") },
+				})
+			)
+		elseif row.kind == "all" then
 			table.insert(keys, "all")
 			table.insert(
 				children,
@@ -1386,6 +1435,7 @@ local function hints_text(state: State, cx: BlockCx, has_feeds: boolean, reserve
 			{ "f", "filter" },
 			catch,
 			{ "m", "read" },
+			{ "R", "read all" },
 			{ "a", "add" },
 			{ "r", "refresh" },
 		}
@@ -1676,6 +1726,12 @@ local rss: BlockDef<State> = {
 		if k.text == "M" or (n == "m" and k.shift) then
 			state.confirm = nil
 			return catch_up(state)
+		elseif k.text == "R" or (n == "r" and k.shift) then
+			-- Headline tabs only: the Feeds list holds feeds, not posts.
+			if state.tab == "feeds" then
+				return false
+			end
+			return toggle_all_read(state)
 		elseif n == "u" and not k.shift then
 			return undo_catch_up(state)
 		end
