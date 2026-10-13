@@ -23,8 +23,8 @@
 -- rule overrides. A pattern is matched against the post's
 -- text as it is; use the `i` flag where case matters.
 --
--- Pure in spirit (only lib/regexp, no tern API), so either half can load it and the store can hold
--- the config.
+-- Pure in spirit (only lib/regexp, and `tern.json.array` to store the rule list), so either half can
+-- load it and the store can hold the config.
 
 local regexp = require("./regexp")
 
@@ -35,9 +35,10 @@ export type Scope = { kind: "all" } | { kind: "group", name: string } | { kind: 
 -- were.
 export type Hit = { title: string, preview: string?, hit: boolean }
 -- A rule: the scope, the action, the pattern, its flags, and the compiled pattern. `raw` is the line
--- as typed, so the panel and filters.json show it back. `broken` is why a stored line does not parse
--- (the rule is kept and written back, never applied); `slow` is set when a real post ran the pattern
--- out of steps (it is skipped from then on); `memo` is the posts it has judged.
+-- as typed, so the panel and filters.json show it back. `broken` is why the rule is not applied: a
+-- stored line that does not parse (kept and written back untouched), or a pattern the engine failed
+-- on while judging a real post; `slow` is set when a real post ran the pattern out of steps (it is
+-- skipped from then on); `memo` is the posts it has judged.
 export type Rule = {
 	scope: Scope,
 	drop: boolean,
@@ -141,11 +142,12 @@ local function skip_class(pat: string, i: number): number
 end
 
 -- What the pattern carries that matters before it compiles: a `|` at its top level (outside any
--- group, class, comment or `\Q…\E` quote, and not escaped), and a `\b` or `\B` outside a quote. In
--- `x` mode a `#` comment runs to the end of the line and holds neither.
-local function scan(pat: string, extended: boolean): (boolean, boolean)
+-- group, class, comment or `\Q…\E` quote, and not escaped), a `\b` or `\B` outside a quote, and an
+-- inline flag group such as `(?i)`. In `x` mode a `#` comment runs to the end of the line and holds
+-- none of them.
+local function scan(pat: string, extended: boolean): (boolean, boolean, boolean)
+	local alternation, boundary, inline = false, false, false
 	local depth, i = 0, 1
-	local alternation, boundary = false, false
 	while i <= #pat do
 		local c = string.sub(pat, i, i)
 		if c == "\\" then
@@ -159,6 +161,9 @@ local function scan(pat: string, extended: boolean): (boolean, boolean)
 				local close = string.find(pat, ")", i + 3, true)
 				i = if close then close + 1 else #pat + 1
 			else
+				if string.find(pat, "^%(%?[imsxnUJX%-]+[%):]", i) then
+					inline = true
+				end
 				-- A group, a flag group or a look-around: each closes with a `)`.
 				depth += 1
 				i += 1
@@ -178,7 +183,7 @@ local function scan(pat: string, extended: boolean): (boolean, boolean)
 			i += 1
 		end
 	end
-	return alternation, boundary
+	return alternation, boundary, inline
 end
 
 -- Text a pattern has to survive when the rule is added: empty, short, runs of one letter, words,
@@ -198,21 +203,143 @@ local SAMPLES: { string } = {
 	string.rep("lorem ipsum dolor sit amet, ", 30),
 }
 
--- `pat` without leading `.*` (or `.*?`). A rule only asks whether the pattern matches anywhere, and
--- `.*X` matches somewhere exactly when `X` does, but the engine retries `.*` from every position and
--- runs it to the end each time, which is quadratic in the post: `/.*sponsor.*/` gave up on a
--- 600-character preview. Removing it changes no group numbers. A pattern that is nothing else stays.
-local function drop_leading_any(pat: string): string
-	local s = pat
-	while string.sub(s, 1, 2) == ".*" and string.sub(s, 3, 3) ~= "+" do
-		s = string.sub(s, if string.sub(s, 3, 3) == "?" then 4 else 3)
+-- The index just past whitespace and `#` comments from `i`: what an `x`-mode pattern ignores.
+local function skip_trivia(s: string, i: number): number
+	while i <= #s do
+		local c = string.sub(s, i, i)
+		if c == "#" then
+			local newline = string.find(s, "\n", i + 1, true)
+			i = if newline then newline + 1 else #s + 1
+		elseif string.find(c, "%s") then
+			i += 1
+		else
+			break
+		end
 	end
-	return if s == "" then pat else s
+	return i
+end
+
+-- The index just past a token at `i` that always consumes exactly one character: `.`, a class, or
+-- `\d \D \s \S \w \W`. Nil for anything else.
+local function single_end(s: string, i: number): number?
+	local c = string.sub(s, i, i)
+	if c == "." then
+		return i + 1
+	elseif c == "\\" then
+		local e = string.sub(s, i + 1, i + 1)
+		if e ~= "" and string.find("dDsSwW", e, 1, true) then
+			return i + 2
+		end
+	elseif c == "[" then
+		local e = skip_class(s, i)
+		if e - 1 > i and string.sub(s, e - 1, e - 1) == "]" then
+			return e
+		end
+	end
+	return nil
+end
+
+-- A greedy or lazy `*`, `+`, `{0,}` or `{1,}` at `j`: the index just past it (and past a lazy `?`),
+-- and whether it needs one repeat. Nil for a possessive one, which cannot give characters back.
+local function open_quantifier(s: string, j: number): (number?, boolean)
+	local e, plus
+	if string.sub(s, j, j) == "*" then
+		e, plus = j + 1, false
+	elseif string.sub(s, j, j) == "+" then
+		e, plus = j + 1, true
+	elseif string.sub(s, j, j + 3) == "{0,}" then
+		e, plus = j + 4, false
+	elseif string.sub(s, j, j + 3) == "{1,}" then
+		e, plus = j + 4, true
+	else
+		return nil, false
+	end
+	local mark = string.sub(s, e, e)
+	if mark == "+" then
+		return nil, false
+	elseif mark == "?" then
+		e += 1
+	end
+	return e, plus
+end
+
+-- Whether `s` can refer to a capture group by number or name, or numbers them in a way that
+-- dropping one group would change. Over-cautious on purpose (a `\Q…\E` quote can trip it).
+local function refers_to_groups(s: string): boolean
+	return string.find(s, "\\[1-9gk]") ~= nil or string.find(s, "%(%?[%d&P%(R%+%-|]") ~= nil
+end
+
+-- `s` without its leading repeat of one character, or nil when it has none or dropping it could
+-- change what the pattern means. A rule only asks whether the pattern matches ANYWHERE, so `Q*X`
+-- (Q one character wide) matches somewhere exactly when `X` does, and `Q+X` exactly when `QX` does.
+-- Possessive repeats are left alone (`.*+X` never matches), as is anything followed by another
+-- quantifier. `(?:Q*)` goes the same way; a capturing `(Q*)` only when nothing after it can refer
+-- to a group, since dropping it would renumber them.
+local function strip_leading(s: string, extended: boolean): string?
+	local i = if extended then skip_trivia(s, 1) else 1
+	local atom, after, plus
+	local e = single_end(s, i)
+	if e then
+		local q_end, needs_one = open_quantifier(s, e)
+		if q_end == nil then
+			return nil
+		end
+		atom, after, plus = string.sub(s, i, e - 1), q_end, needs_one
+	elseif string.sub(s, i, i) == "(" then
+		local capture = string.sub(s, i + 1, i + 1) ~= "?"
+		if not capture and string.sub(s, i, i + 2) ~= "(?:" then
+			return nil
+		end
+		local start = if capture then i + 1 else i + 3
+		local inner = single_end(s, start)
+		local q_end, needs_one = nil, false
+		if inner then
+			q_end, needs_one = open_quantifier(s, inner)
+		end
+		if inner == nil or q_end == nil or string.sub(s, q_end, q_end) ~= ")" then
+			return nil
+		end
+		if capture and refers_to_groups(string.sub(s, q_end + 1)) then
+			return nil
+		end
+		atom, after, plus = string.sub(s, start, inner - 1), q_end + 1, needs_one
+	else
+		return nil
+	end
+	local nxt = if extended then skip_trivia(s, after) else after
+	if string.find(string.sub(s, nxt, nxt), "^[%*%+%?{]") then
+		return nil
+	end
+	local rest = string.sub(s, after)
+	return if plus then (atom :: string) .. rest else rest
+end
+
+-- `pat` without leading `.*`-like repeats (strip_leading). The engine retries `.*` from every
+-- position and runs it to the end each time, which is quadratic in the post: `/.*sponsor.*/` gave up
+-- on a 600-character preview. A pattern that is nothing else stays.
+local function drop_leading_any(pat: string, extended: boolean): string
+	local s = pat
+	while true do
+		local nxt = strip_leading(s, extended)
+		if nxt == nil or (if extended then skip_trivia(nxt, 1) > #nxt else nxt == "") then
+			break
+		end
+		s = nxt
+	end
+	return s
+end
+
+-- The engine's complaint without its file and line.
+local function engine_message(err: any): string
+	return string.match(tostring(err), "^[^:]*:%d+: (.*)$") or tostring(err)
 end
 
 -- Compiles `pat` with `flags`. Returns the compiled pattern, or nil and the engine's complaint.
+-- `stored` skips the add-time samples: a line read back from filters.json passed them when it was
+-- added, and running them again on every load costs seconds for a handful of slow rules; a pattern
+-- that is slow anyway is marked slow by the first real post that finds out.
 --
--- Three of the vendored engine's behaviours are worked around here, all verified against it:
+-- Four of the vendored engine's behaviours are worked around here, all verified against it:
 --
 --   * Top-level alternation only ever matches at the first position, so `/ads|广告/` misses a post
 --     whose title starts with something else. Wrapping the pattern in a group fixes it, and only a
@@ -225,34 +352,43 @@ end
 --     without end. lib/regexp counts its steps and raises past a limit; the samples above find the
 --     patterns that hit it, and the same limit marks a rule slow if a real post finds one first.
 --   * A leading `.*` makes every search quadratic in the post; it is dropped (drop_leading_any).
-function filter.compile(pat: string, flags: string): (any?, string?)
+function filter.compile(pat: string, flags: string, stored: boolean?): (any?, string?)
 	for i = 1, #flags do
 		local c = string.sub(flags, i, i)
 		if not FLAGS[c] then
 			return nil, `Unknown flag "{c}"; the flags are i, m, s and x`
 		end
 	end
-	local body = drop_leading_any(pat)
-	local alternation, boundary = scan(body, string.find(flags, "x", 1, true) ~= nil)
+	local extended = string.find(flags, "x", 1, true) ~= nil
+	local body = drop_leading_any(pat, extended)
+	local alternation, boundary, inline = scan(body, extended)
 	if boundary then
 		return nil, "The engine cannot run \\b or \\B; use a capture like (^| )word, or stop at spaces"
 	end
-	local close = if string.find(flags, "x", 1, true) then "\n)" else ")"
+	if inline then
+		return nil, "Inline flags like (?i) are not supported; put the flags after the closing slash instead, as in /pattern/i"
+	end
+	local close = if extended then "\n)" else ")"
 	local source = if alternation then `(?:{body}{close}` else body
 	local ok, rx = pcall(function()
 		return regexp.new(source, flags)
 	end)
 	if not ok then
-		-- The engine names its own file and line; the field wants the complaint, not the path.
-		local message = string.match(tostring(rx), "^[^:]*:%d+: (.*)$") or tostring(rx)
-		return nil, `Pattern error: {message}`
+		return nil, `Pattern error: {engine_message(rx)}`
+	end
+	if stored then
+		return rx
 	end
 	for i, sample in SAMPLES do
 		local ran, err = pcall(function()
 			return rx:test(sample)
 		end)
-		if not ran and string.find(tostring(err), STEP_ERROR, 1, true) then
-			if i == #SAMPLES then
+		if not ran then
+			if not string.find(tostring(err), STEP_ERROR, 1, true) then
+				-- Some shapes the engine builds and then trips over (a quantified look-behind, a
+				-- recursion with nothing to recurse into); they would fail on every post.
+				return nil, `The engine cannot run that pattern ({engine_message(err)}); simplify it`
+			elseif i == #SAMPLES then
 				return nil, "That pattern is too slow on a post-length text; simplify it (a rule already matches anywhere, so it needs no (.*) around it)"
 			end
 			return nil, "That pattern can loop or backtrack without end; simplify its repeated groups"
@@ -341,7 +477,7 @@ end
 
 -- One rule line, as documented at the top of this file. Returns the rule, or nil and a reason to
 -- show under the field.
-function filter.parse(line: string): (Rule?, string?)
+function filter.parse(line: string, stored: boolean?): (Rule?, string?)
 	local s = trim(line)
 	if s == "" then
 		return nil, "Type a rule: /pattern/ or @group drop /pattern/i"
@@ -361,6 +497,10 @@ function filter.parse(line: string): (Rule?, string?)
 			name, after = read_bare_name(s, 2)
 		end
 		if name == "" then
+			local first = string.match(s, "^%a+", skip_space(s, 2))
+			if first ~= nil and is_action(first) then
+				return nil, `A scope needs a name; to name one "{string.lower(first)}", quote it: {mark}"{string.lower(first)}" /pattern/`
+			end
 			return nil, `A scope needs a name: @group or #feed`
 		end
 		scope = if mark == "@" then { kind = "group", name = name } else { kind = "feed", key = name }
@@ -395,7 +535,7 @@ function filter.parse(line: string): (Rule?, string?)
 	if pat == "" then
 		return nil, "That pattern is empty"
 	end
-	local rx, err = filter.compile(pat, flags)
+	local rx, err = filter.compile(pat, flags, stored)
 	if rx == nil then
 		return nil, err
 	end
@@ -435,7 +575,8 @@ local function in_scope(scope: Scope, f: { id: string, title: string, url: strin
 		return false
 	end
 	if scope.kind == "group" then
-		return filter.group(f) == scope.name
+		-- Like a feed's name: ASCII case does not matter, so `@news` covers the group `News`.
+		return string.lower(filter.group(f)) == string.lower(scope.name)
 	end
 	local want = string.lower(scope.key)
 	if want == string.lower(f.id) or want == string.lower(f.title) or want == string.lower(f.url) then
@@ -483,8 +624,13 @@ local function matches(r: Rule, item: { key: string, title: string, preview: str
 	local ran, hit = pcall(function()
 		return r.rx:test(filter.text(item))
 	end)
-	if not ran and string.find(tostring(hit), STEP_ERROR, 1, true) then
-		r.slow = true
+	if not ran then
+		if string.find(tostring(hit), STEP_ERROR, 1, true) then
+			r.slow = true
+		else
+			-- The engine tripped over this pattern (see compile); the panel shows why.
+			r.broken = `Pattern error: {engine_message(hit)}`
+		end
 		return false
 	end
 	if r.memo_n >= MEMO_MAX then
@@ -503,7 +649,7 @@ end
 function filter.slow_count(cfg: Config): number
 	local n = 0
 	for _, r in cfg.rules do
-		if r.slow then
+		if r.slow or r.broken ~= nil then
 			n += 1
 		end
 	end
@@ -585,7 +731,8 @@ function filter.encode(cfg: Config): { [string]: any }
 	for _, r in cfg.rules do
 		table.insert(rules, r.raw)
 	end
-	return { version = 1, read = cfg.read, groups = cfg.groups, excluded = cfg.excluded, rules = rules }
+	-- An empty list would be written as `{}`, which reads as a table of keys.
+	return { version = 1, read = cfg.read, groups = cfg.groups, excluded = cfg.excluded, rules = tern.json.array(rules) }
 end
 
 -- The config in `v`, and how many stored rule lines no longer parse (they stay in the list as
@@ -617,7 +764,7 @@ function filter.decode(v: any): (Config, number)
 	if type(v.rules) == "table" then
 		for _, line in ipairs(v.rules) do
 			if type(line) == "string" then
-				local r, reason = filter.parse(line)
+				local r, reason = filter.parse(line, true)
 				if r then
 					table.insert(cfg.rules, r)
 				else
