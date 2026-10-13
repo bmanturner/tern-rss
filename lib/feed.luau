@@ -144,8 +144,14 @@ local function cut(s: string, max: number): string
 		return s
 	end
 	local at = max
-	while at > 1 and (string.byte(s, at + 1) or 0) >= 0x80 and (string.byte(s, at + 1) or 0) < 0xC0 do
-		at -= 1 -- don't split a UTF-8 sequence
+	-- A sequence is at most 4 bytes, so at most 3 continuation bytes are backed over: a run of
+	-- stray continuation bytes (not UTF-8 at all) must not walk the cut back to the start.
+	for _ = 1, 3 do
+		local b = string.byte(s, at + 1) or 0
+		if at <= 1 or b < 0x80 or b >= 0xC0 then
+			break
+		end
+		at -= 1
 	end
 	return string.sub(s, 1, at)
 end
@@ -165,41 +171,148 @@ local function tidy(s: string): string
 	return trim(s)
 end
 
--- Paragraph-ending tags become blank lines so previews can be cut by paragraph.
-local BREAKS: { { string } } = {
-	{ "<[Bb][Rr]>", "\n" },
-	{ "<[Bb][Rr][%s/][^>]*>", "\n" },
-	{ "</[Pp]%s*>", "\n\n" },
-	{ "</[Dd][Ii][Vv]%s*>", "\n" },
-	{ "</[Ll][Ii]%s*>", "\n" },
-	{ "</[Hh][1-6]%s*>", "\n\n" },
-	{ "</[Bb][Ll][Oo][Cc][Kk][Qq][Uu][Oo][Tt][Ee]%s*>", "\n\n" },
-	{ "</[Tt][Rr]%s*>", "\n" },
-	{ "<[Ll][Ii]>", "• " },
-	{ "<[Ll][Ii]%s[^>]*>", "• " },
+-- Longest tag name the HTML scanner reads; a longer one is no tag it knows.
+local HTML_NAME_MAX = 32
+
+-- The HTML scanner behind previews, titles and the reader: calls `on_text(from, to)` for each run
+-- of text and `on_tag(name, closing, lt, gt)` for each tag (`name` lowercase; `lt`/`gt` the
+-- positions of its "<" and ">"). A callback that returns true (text) or a position (tag) ends the
+-- walk or resumes it there. <script>/<style> bodies and comments are skipped here, and an
+-- unclosed one ends the document, as it does in a browser. `lower` is `s` lowercased (same
+-- offsets), `truncated` says `s` was cut mid-document, so a half tag at the end is dropped.
+--
+-- Linear on any input: the cursor only moves forward and every search (plain find or a pattern
+-- without backtracking) starts at it, so a page of "<" or of unclosed <script> costs no more than
+-- a page of text. This replaces gsub patterns like "<[^>]+>" and "<script.-</script>", which
+-- rescan to the end of the input from every "<".
+local function walk(
+	s: string,
+	lower: string,
+	truncated: boolean,
+	on_text: (from: number, to: number) -> boolean?,
+	on_tag: (name: string, closing: boolean, lt: number, gt: number) -> number?
+)
+	local n = #s
+	local text_from = 1
+	local pos = 1
+	while true do
+		-- A "<" only opens a tag before a letter, "/", "!" or "?": "a < b" is text.
+		local lt = string.find(s, "<[%a/!?]", pos)
+		if lt == nil then
+			if text_from <= n then
+				on_text(text_from, n)
+			end
+			return
+		end
+		if lt > text_from and on_text(text_from, lt - 1) then
+			return
+		end
+		text_from = lt
+		if string.sub(s, lt, lt + 3) == "<!--" then
+			local close = string.find(s, "-->", lt + 4, true)
+			if close == nil then
+				return
+			end
+			text_from = close + 3
+			pos = text_from
+			continue
+		end
+		local gt = string.find(s, ">", lt + 1, true)
+		if gt == nil then
+			if not truncated then
+				on_text(lt, n)
+			end
+			return
+		end
+		text_from = gt + 1
+		pos = text_from
+		local _, _, slash, name = string.find(lower, "^(/?)([%w%-]*)", lt + 1)
+		if name == nil or name == "" or #name > HTML_NAME_MAX then
+			continue -- <!doctype>, <?xml?>, a stray "</>", a name no tag has
+		end
+		if slash == "" and (name == "script" or name == "style") then
+			local close = string.find(lower, "</" .. name, gt + 1, true)
+			local close_gt = if close then string.find(s, ">", close, true) else nil
+			if close_gt == nil then
+				return
+			end
+			text_from = close_gt + 1
+			pos = text_from
+			continue
+		end
+		local jump = on_tag(name, slash == "/", lt, gt)
+		if jump then
+			text_from = jump
+			pos = jump
+		end
+	end
+end
+
+-- What an opening or closing tag leaves behind in a preview, so it can be cut by paragraph.
+local PREVIEW_OPEN: { [string]: string } = { br = "\n", p = "\n\n", li = "• " }
+local PREVIEW_CLOSE: { [string]: string } = {
+	p = "\n\n",
+	div = "\n",
+	li = "\n",
+	h1 = "\n\n",
+	h2 = "\n\n",
+	h3 = "\n\n",
+	h4 = "\n\n",
+	h5 = "\n\n",
+	h6 = "\n\n",
+	blockquote = "\n\n",
+	tr = "\n",
 }
 
--- `max` raises the source cap above the preview's, for callers that measure a whole page.
-local function html_to_text(s: string, max: number?): string
-	local limit = max or PREVIEW_SOURCE_MAX
-	if #s > limit then
-		s = cut(s, limit)
-		s = string.gsub(s, "<[^>]*$", "") -- a tag cut in half
+-- Plain text of an HTML fragment, cut to PREVIEW_SOURCE_MAX bytes first.
+local function html_to_text(s: string): string
+	local truncated = #s > PREVIEW_SOURCE_MAX
+	if truncated then
+		s = cut(s, PREVIEW_SOURCE_MAX)
 	end
-	s = string.gsub(s, "<[Ss][Cc][Rr][Ii][Pp][Tt].-</[Ss][Cc][Rr][Ii][Pp][Tt]%s*>", "")
-	s = string.gsub(s, "<[Ss][Tt][Yy][Ll][Ee].-</[Ss][Tt][Yy][Ll][Ee]%s*>", "")
-	for _, rule in BREAKS do
-		s = string.gsub(s, rule[1], rule[2])
-	end
-	s = string.gsub(s, "<[^>]+>", "")
-	return tidy(decode_entities(s))
+	local buf: { string } = {}
+	-- Right after a bullet: the item's own leading whitespace (pretty-printed markup) goes.
+	local lead = false
+	walk(s, string.lower(s), truncated, function(from: number, to: number): boolean?
+		local text = string.sub(s, from, to)
+		if lead then
+			local first = string.find(text, "%S")
+			if first == nil then
+				return nil
+			end
+			text = string.sub(text, first)
+			lead = false
+		end
+		table.insert(buf, text)
+		return nil
+	end, function(name: string, closing: boolean): number?
+		local mark = if closing then PREVIEW_CLOSE[name] else PREVIEW_OPEN[name]
+		if mark then
+			table.insert(buf, mark)
+			lead = name == "li" and not closing
+		end
+		return nil
+	end)
+	return tidy(decode_entities(table.concat(buf)))
+end
+
+-- `s` without its tags (no breaks), for titles.
+local function strip_tags(s: string): string
+	local buf: { string } = {}
+	walk(s, string.lower(s), false, function(from: number, to: number): boolean?
+		table.insert(buf, string.sub(s, from, to))
+		return nil
+	end, function(): number?
+		return nil
+	end)
+	return table.concat(buf)
 end
 
 -- `s` is already XML-decoded; html titles may still carry markup and HTML entities.
 local function clean_title(s: string, html: boolean): string
 	s = cut(s, TITLE_SOURCE_MAX)
 	if html then
-		s = string.gsub(s, "<[^>]+>", "")
+		s = strip_tags(s)
 	end
 	return fmt.clip(collapse(decode_entities(s)), TITLE_MAX)
 end
@@ -207,25 +320,44 @@ end
 --------------------------------------------------------------------------------------------------
 -- Tokenizer
 
+-- `name="value"` pairs of a tag's source, names lowercased and values entity-decoded; `loose` also
+-- reads unquoted values (rel=alternate type=application/rss+xml). One forward pass: each search is
+-- anchored at the cursor, so a long run of name characters is read once, not once per start.
 local function decode_attrs(s: string, loose: boolean?): { [string]: string }
 	local attrs: { [string]: string } = {}
 	if not string.find(s, "=", 1, true) then
 		return attrs
 	end
-	for name, _, value in string.gmatch(s, "([%w_:%-%.]+)%s*=%s*([\"'])(.-)%2") do
-		if name and value then
-			attrs[string.lower(name)] = decode_entities(value)
+	local pos = 1
+	while true do
+		local name_from, name_to = string.find(s, "[%w_:%-%.]+", pos)
+		if name_from == nil then
+			break
 		end
-	end
-	if loose then -- HTML also allows unquoted values (rel=alternate type=application/rss+xml)
-		local rest = string.gsub(s, "[%w_:%-%.]+%s*=%s*([\"']).-%1", " ")
-		for name, value in string.gmatch(rest, "([%w_:%-%.]+)%s*=%s*([^%s\"'>]+)") do
-			if name and value then
-				local key = string.lower(name)
-				if attrs[key] == nil then
-					attrs[key] = decode_entities(value)
-				end
+		local _, eq_to = string.find(s, "^%s*=%s*", name_to + 1)
+		if eq_to == nil then
+			pos = name_to + 1
+			continue
+		end
+		local key = string.lower(string.sub(s, name_from, name_to))
+		local quote = string.sub(s, eq_to + 1, eq_to + 1)
+		if quote == '"' or quote == "'" then
+			local close = string.find(s, quote, eq_to + 2, true)
+			if close == nil then
+				break
 			end
+			attrs[key] = decode_entities(string.sub(s, eq_to + 2, close - 1))
+			pos = close + 1
+		else
+			local _, value_to = string.find(s, "^[^%s\"'>]+", eq_to + 1)
+			if value_to == nil then
+				pos = eq_to + 1
+				continue
+			end
+			if loose and attrs[key] == nil then
+				attrs[key] = decode_entities(string.sub(s, eq_to + 1, value_to))
+			end
+			pos = value_to + 1
 		end
 	end
 	return attrs
@@ -986,178 +1118,508 @@ export type Article = { blocks: { ArticleBlock }, text: string }
 local ARTICLE_SOURCE_MAX = 1_500_000
 -- Beyond this many characters of extracted text the article is truncated (about 40 screens).
 local ARTICLE_TEXT_MAX = 120_000
+-- Page text read per run and queued per block, before escaping: a megabyte of one paragraph is
+-- never all shipped, so it is never all processed.
+local READ_MAX = 2 * ARTICLE_TEXT_MAX
 -- At most this many images ship with one article.
 local ARTICLE_IMAGES_MAX = 12
+-- Less text than this and the page counts as unreadable: the reader hands it to the browser.
+local ARTICLE_MIN_TEXT = 400
+-- A <pre> block keeps at most this many source bytes.
+local PRE_MAX = 60_000
+-- Declared image sizes are clamped to 1..this.
+local IMAGE_DIM_MAX = 10_000
+-- Bytes of a page that aren't UTF-8 are repaired one by one up to this many; past it the page is
+-- plainly not UTF-8 and the rest is widened wholesale.
+local REPAIR_MAX = 5000
 
--- The container the reader reads, named by tag: the semantic one (`article`, `main`, …) with the
--- longest text, and `body` only when none has a readable amount. Body always holds at least as
--- much text as anything inside it, so measured against the rest it would win on every page with a
--- nav bar or a footer. Tags are found in a lowercased copy (same byte offsets) so `<ARTICLE>`
--- counts, and every candidate is measured over the whole page, not the preview's first 16 KB.
-local function article_container(html: string): (string, string, string)
-	local lower = string.lower(html)
-	local function measure(kind: string): (string?, string?)
-		local open = string.find(lower, "<" .. kind .. "[%s>/]")
-		if open == nil then
-			return nil, nil
-		end
-		local gt = string.find(html, ">", open, true) or open
-		local close = string.find(lower, "</" .. kind .. ">", gt, true)
-		local inner = string.sub(html, gt + 1, if close then close - 1 else #html)
-		return inner, html_to_text(inner, ARTICLE_SOURCE_MAX)
+-- Single bytes 0x80-0xFF as the UTF-8 of their windows-1252 character, for gsub.
+local WIDE: { [string]: string } = {}
+for byte = 0x80, 0xFF do
+	WIDE[string.char(byte)] = utf8.char(cp1252(byte))
+end
+-- Charset names (lowercase, without "-" and "_") read as windows-1252, like browsers read latin-1.
+local LATIN1: { [string]: boolean } = { iso88591 = true, latin1 = true, l1 = true, windows1252 = true, cp1252 = true }
+
+-- The charset a page declares: the Content-Type header's, else a <meta> in the first 2 KB.
+local function page_charset(body: string, content_type: string?): string?
+	local name = string.match(string.lower(content_type or ""), "charset%s*=%s*[\"']?([%w_%-]+)")
+	if name == nil then
+		local head = string.lower(string.sub(body, 1, 2048))
+		name = string.match(head, "<meta[^>]-charset%s*=%s*[\"']?([%w_%-]+)")
 	end
-	local best_kind, best_src, best_text = "body", html, ""
-	for _, kind in { "article", "main", "content", "post" } do
-		local inner, text = measure(kind)
-		if inner and text and #text > #best_text and #text > 400 then
-			best_kind, best_src, best_text = kind, inner, text
+	if name == nil then
+		return nil
+	end
+	return (string.gsub(name, "[%-_]", ""))
+end
+
+-- `body` as valid UTF-8, which the view needs (Tern raises on anything else): a latin-1 or
+-- windows-1252 page is widened through the cp1252 table, and any other bytes that aren't UTF-8
+-- (a charset this plugin has no table for) are mapped the same way, so the page stays readable
+-- instead of failing every render.
+local function page_utf8(body: string, content_type: string?): string
+	local charset = page_charset(body, content_type)
+	if charset and LATIN1[charset] then
+		return (string.gsub(body, "[\128-\255]", WIDE))
+	end
+	if utf8.len(body) then
+		return body
+	end
+	local out: { string } = {}
+	local from = 1
+	local fixes = 0
+	while true do
+		local ok, bad = utf8.len(body, from)
+		if ok then
+			table.insert(out, string.sub(body, from))
+			break
+		end
+		table.insert(out, string.sub(body, from, (bad :: number) - 1))
+		fixes += 1
+		if fixes > REPAIR_MAX then
+			table.insert(out, (string.gsub(string.sub(body, bad :: number), "[\128-\255]", WIDE)))
+			break
+		end
+		table.insert(out, WIDE[string.sub(body, bad :: number, bad :: number)])
+		from = (bad :: number) + 1
+	end
+	return table.concat(out)
+end
+
+type Span = { from: number, cum: number, depth: number, closed: boolean, to: number, len: number }
+
+-- The container the reader reads, named by tag: `article` or `main` with the most text, and `body`
+-- only when neither has a readable amount. Body always holds at least as much text as anything
+-- inside it, so measured against the rest it would win on every page with a nav bar or a footer.
+-- One scan measures them all: text bytes seen so far at each tag, and a container ends at the
+-- close tag that matches its open (a nested `<article>`, as comments and embeds use, doesn't end
+-- it). Only the first container of each kind counts. Whitespace-only runs don't count as text.
+-- Returns the kind and the container's source.
+local function article_container(html: string, lower: string): (string, string)
+	local spans: { [string]: Span } = {}
+	local seen = 0
+	walk(html, lower, false, function(from: number, to: number): boolean?
+		local first = string.find(html, "%S", from)
+		if first and first <= to then
+			seen += to - first + 1
+		end
+		return nil
+	end, function(name: string, closing: boolean, lt: number, gt: number): number?
+		if name ~= "article" and name ~= "main" and name ~= "body" then
+			return nil
+		end
+		local span = spans[name]
+		if not closing then
+			if span == nil then
+				spans[name] = { from = gt + 1, cum = seen, depth = 1, closed = false, to = #html, len = 0 }
+			elseif not span.closed then
+				span.depth += 1
+			end
+		elseif span and not span.closed then
+			span.depth -= 1
+			if span.depth == 0 then
+				span.closed = true
+				span.to = lt - 1
+				span.len = seen - span.cum
+			end
+		end
+		return nil
+	end)
+	for _, span in spans do
+		if not span.closed then
+			span.len = seen - span.cum
 		end
 	end
-	if best_text == "" then
-		local inner, text = measure("body")
-		if inner and text and #text > 400 then
-			best_src, best_text = inner, text
+	local best_kind = "body"
+	local best: Span? = nil
+	for _, kind in { "article", "main" } do
+		local span = spans[kind]
+		if span and span.len > ARTICLE_MIN_TEXT and (best == nil or span.len > best.len) then
+			best_kind, best = kind, span
 		end
 	end
-	return best_kind, best_src, best_text
+	if best == nil then
+		local body = spans.body
+		if body and body.len > ARTICLE_MIN_TEXT then
+			best = body
+		end
+	end
+	if best == nil then
+		return "body", html
+	end
+	return best_kind, string.sub(html, best.from, best.to)
 end
 
 -- `s` as literal Markdown text: page prose is data, not markup. Without this "$5 or $10" typesets
 -- as math and a printed `[x](tern-rss://read/…)` becomes a clickable route link. Backslash escapes
--- cover the metacharacters ui.md's dialect reads; the structure this file adds (`#`, `- `) is
--- written after escaping, so it stays live. Only `[` is escaped, never `]`: the dialect reads
--- `\[…\]` as display math, so an escaped pair would typeset the text between.
+-- cover the metacharacters ui.md's dialect reads inside a line; what only means something at the
+-- start of a line (`-`, `1.`, `===`) is escaped once the lines are known (finish_md), and the
+-- structure this file adds (`#`, `- `, `> `) is written after that, so it stays live. Only `[` is
+-- escaped, never `]`: the dialect reads `\[…\]` as display math, so an escaped pair would
+-- typeset the text between.
 local function md_escape(s: string): string
 	s = string.gsub(s, "[\\`*_%[<>#|~$]", "\\%0")
 	-- A decoded "&amp;lt;" must not read as an entity again.
 	s = string.gsub(s, "&(#?%w+;)", "\\&%1")
-	-- Bare URLs autolink; this plugin's own route scheme must not be printable as a link.
-	s = string.gsub(s, "([Tt][Ee][Rr][Nn]%-[Rr][Ss][Ss]:)//", "%1\\//")
 	return s
 end
 
--- Tag names that break a text run, and what they leave behind. `<br>` and `<li>` key their opening
--- form, the rest their closing form.
-local BREAKS_HTML: { [string]: string } = {
-	["<br"] = "\n",
-	["</p"] = "\n\n",
-	["</div"] = "\n",
-	["</li"] = "\n",
-	["</ul"] = "\n\n",
-	["</ol"] = "\n\n",
-	["</h1"] = "\n\n",
-	["</h2"] = "\n\n",
-	["</h3"] = "\n\n",
-	["</h4"] = "\n\n",
-	["</h5"] = "\n\n",
-	["</h6"] = "\n\n",
-	["</blockquote"] = "\n\n",
-	["</tr"] = "\n",
+-- Structure markers the walk writes into the text before it is tidied, as control bytes that page
+-- text can't carry (it is stripped of them): \1 a bullet, \2<n>\3 a numbered item, \4<n>\3 a
+-- heading of that level, \5 before a newline a hard break. `finish_md` turns them into Markdown.
+
+-- Prefixes every line of `text` with the blockquote marker.
+local function quote_lines(text: string): string
+	local out: { string } = {}
+	local at = 1
+	local n = #text
+	while at <= n + 1 do
+		local nl = string.find(text, "\n", at, true) or n + 1
+		local line = string.sub(text, at, nl - 1)
+		table.insert(out, if line == "" then ">" else "> " .. line)
+		at = nl + 1
+	end
+	return table.concat(out, "\n")
+end
+
+-- Tidied text carrying the walk's markers, as Markdown: markers resolved, text at the start of a
+-- line that would read as a list, rule or heading underline escaped (`- x`, `+ x`, `2024. x`,
+-- `---`, `===`), this plugin's route scheme made unprintable as a link (on the joined text, so
+-- tags between its letters don't hide it), and blockquote lines prefixed when `quoted`.
+local function finish_md(text: string, quoted: boolean): string
+	if not string.find(text, "%S") then
+		return ""
+	end
+	text = string.gsub(text, "([Tt][Ee][Rr][Nn]%-[Rr][Ss][Ss]:)//", "%1\\//")
+	text = string.gsub(text, "\5\n([^\n])", "  \n%1")
+	text = string.gsub(text, "\5", "")
+	local out: { string } = {}
+	local at = 1
+	local n = #text
+	while at <= n + 1 do
+		local nl = string.find(text, "\n", at, true) or n + 1
+		local line = string.sub(text, at, nl - 1)
+		at = nl + 1
+		local prefix = ""
+		local mark = string.byte(line, 1)
+		if mark == 1 then
+			prefix, line = "- ", string.sub(line, 2)
+		elseif mark == 2 or mark == 4 then
+			local num, rest = string.match(line, "^[\2\4](%d+)\3(.*)$")
+			if num then
+				prefix = if mark == 2 then num .. ". " else string.rep("#", tonumber(num) :: number) .. " "
+				line = rest
+			end
+		end
+		local first = string.sub(line, 1, 1)
+		if first == "-" or first == "+" or first == "=" then
+			line = "\\" .. line
+		elseif string.find(line, "^%d+[.)]") then
+			line = string.gsub(line, "^(%d+)([.)])", "%1\\%2")
+		end
+		line = prefix .. line
+		table.insert(out, if quoted and line ~= "" then "> " .. line elseif quoted then ">" else line)
+	end
+	return trim(table.concat(out, "\n"))
+end
+
+-- The text of a <pre> source fragment: tags dropped (a <br> is a newline), entities decoded,
+-- line endings normalised, the blank lines around it gone, indentation kept.
+local function pre_text(fragment: string): string
+	fragment = cut(fragment, PRE_MAX)
+	local parts: { string } = {}
+	walk(fragment, string.lower(fragment), true, function(from: number, to: number): boolean?
+		table.insert(parts, string.sub(fragment, from, to))
+		return nil
+	end, function(name: string): number?
+		if name == "br" then
+			table.insert(parts, "\n")
+		end
+		return nil
+	end)
+	local text = decode_entities(table.concat(parts))
+	text = string.gsub(text, "\r\n?", "\n")
+	text = string.gsub(text, "^\n", "")
+	local last = #text
+	while last > 0 do
+		local b = string.byte(text, last)
+		if b ~= 32 and (b < 9 or b > 13) then
+			break
+		end
+		last -= 1
+	end
+	return string.sub(text, 1, last)
+end
+
+-- A code fence around `text` that no run of backticks inside it can close.
+local function fenced(text: string): string
+	local longest = 0
+	for run in string.gmatch(text, "`+") do
+		longest = math.max(longest, #run)
+	end
+	local fence = string.rep("`", math.max(3, longest + 1))
+	return fence .. "\n" .. text .. "\n" .. fence
+end
+
+-- A declared width or height as a finite number of pixels in 1..IMAGE_DIM_MAX; nothing for
+-- percentages, units, huge or non-numeric values (an `inf` would break the view).
+local function dimension(value: string?): number?
+	local digits = if value then string.match(value, "^%s*(%d+)%s*[pP]?[xX]?%s*$") else nil
+	local n = if digits then tonumber(digits) else nil
+	if n == nil or n < 1 then
+		return nil
+	end
+	return math.min(n, IMAGE_DIM_MAX)
+end
+
+-- Where an <img> keeps the picture, best first: the lazy-load attributes hold the real file when
+-- `src` is a placeholder, and `srcset` is the last resort.
+local IMAGE_SOURCES = { "data-src", "data-lazy-src", "data-original", "src", "srcset", "data-srcset" }
+
+-- The address of the first usable source among `attrs`, resolved against `base`: absolute
+-- http(s) without whitespace (`javascript:`, `data:` and friends would each raise in tern.fetch),
+-- and not a private or loopback address unless `private_ok` (the article itself is one).
+local function image_src(attrs: { [string]: string }, base: string, private_ok: boolean): string?
+	for _, key in IMAGE_SOURCES do
+		local value = attrs[key]
+		if value and (key == "srcset" or key == "data-srcset") then
+			value = string.match(value, "^%s*([^%s,]+)") -- the first candidate's URL
+		end
+		value = trim(value or "")
+		if value ~= "" and #value < 2048 then
+			local abs = url.resolve(base, value)
+			if
+				string.find(abs, "^[hH][tT][tT][pP][sS]?://[^%s/?#]")
+				and not string.find(abs, "%s")
+				and (private_ok or not url.is_private(abs))
+			then
+				return abs
+			end
+		end
+	end
+	return nil
+end
+
+-- Subtrees that are page furniture, not the article: dropped whole, counting nested ones of the
+-- same name. `header` is the article's own byline when the container is an <article>.
+local FURNITURE: { [string]: boolean } = {
+	nav = true,
+	aside = true,
+	footer = true,
+	header = true,
+	form = true,
+	button = true,
 }
 
--- The article in `body` (an HTML page), read for the native reader: the container's content as
--- interleaved Markdown and image blocks, in document order, plus the whole text for the "is there
--- anything here" check. `blocks` is empty when nothing useful came out, and the caller falls back
--- to the browser. The walk is the preview's html_to_text with two differences: <img> becomes an
--- image block instead of vanishing, and headings become Markdown `#` lines so ui.md draws the
--- structure. Linear: every "<" and ">" is searched for once.
-function feed.article(body: string, base: string): Article
-	local html = if #body > ARTICLE_SOURCE_MAX then string.sub(body, 1, ARTICLE_SOURCE_MAX) else body
-	local _kind, inner = article_container(html)
-	if inner == "" then
-		return { blocks = {}, text = "" }
-	end
-	-- Lowercased once: tag names are matched here, and a copy per <script> was quadratic.
+-- What an opening tag leaves in the text, and what a closing one that ends a block does after the
+-- text so far is flushed.
+local OPEN_BREAK: { [string]: string } = { p = "\n\n", div = "\n\n", dd = "\n\n", dt = "\n\n", table = "\n\n" }
+local CLOSE_BREAK: { [string]: string } = { p = "\n\n", div = "\n", table = "\n\n" }
+
+-- Walks `inner` (the container's source) into blocks. `furniture` drops FURNITURE subtrees; the
+-- second result says whether any was dropped. The walk is the preview's html_to_text with
+-- structure kept: <img> becomes an image block, headings, list items, quotes, code and line
+-- breaks become the Markdown ui.md draws.
+local function render(inner: string, kind: string, base: string, furniture: boolean): (Article, boolean)
 	local lower = string.lower(inner)
+	local private_ok = url.is_private(base)
 	local blocks: { ArticleBlock } = {}
 	local buf: { string } = {}
 	local images = 0
 	-- Markdown bytes flushed so far; the walk stops once the article is past the cap.
 	local total = 0
+	local quotes = 0 -- open <blockquote>s
+	local lists: { { ordered: boolean, n: number } } = {}
+	-- The marker ("li" or "h1".."h6") the next text opens with. It is written only once text
+	-- arrives, so an empty item or heading leaves nothing behind and the whitespace between a
+	-- marker and its text (pretty-printed markup) is dropped.
+	local pending: string? = nil
+	local in_heading = false
+	local cells = 0 -- cells so far in the current row
+	local skip_name: string? = nil
+	local skip_depth = 0
+	local dropped = false
+	-- Page text queued since the last flush, and whether the walk has read all it will ship: a
+	-- page that is all one paragraph never flushes, so the queue is bounded by the source read
+	-- (twice the cap leaves room for the whitespace tidy drops).
+	local queued = 0
+	local done = false
 
 	local function flush()
-		local md = tidy(table.concat(buf))
+		local md = finish_md(tidy(table.concat(buf)), quotes > 0)
 		buf = {}
+		queued = 0
 		if md ~= "" then
 			total += #md
 			table.insert(blocks, { kind = "md", text = md })
 		end
 	end
 
-	local function add_text(s: string)
-		table.insert(buf, md_escape(decode_entities(s)))
+	-- Drops the whitespace queued at the end of the text, so a list item starts on the line after
+	-- the last one (a blank line between items would draw a loose list).
+	local function trim_tail()
+		while #buf > 0 do
+			local last = buf[#buf]
+			local first = string.find(last, "%S")
+			if first == nil then
+				table.remove(buf)
+			else
+				local at = #last
+				while at > first do
+					local b = string.byte(last, at)
+					if b ~= 32 and (b < 9 or b > 13) then
+						break
+					end
+					at -= 1
+				end
+				buf[#buf] = string.sub(last, 1, at)
+				return
+			end
+		end
 	end
 
-	local pos = 1
-	while total <= ARTICLE_TEXT_MAX do
-		local lt = string.find(inner, "<", pos, true)
-		if lt == nil then
-			add_text(string.sub(inner, pos))
-			break
-		end
-		if lt > pos then
-			add_text(string.sub(inner, pos, lt - 1))
-		end
-		local gt = string.find(inner, ">", lt, true)
-		if gt == nil then -- a half tag at the source cap: the rest is text
-			add_text(string.sub(inner, lt))
-			break
-		end
-		pos = gt + 1
-		local raw = string.sub(inner, lt + 1, gt - 1)
-		-- Both captures matter: the slash (a closing tag) and the name. The name takes digits too:
-		-- `h1`-`h6` never matched as letters only, so no heading was ever drawn as one.
-		local slash, bare = string.match(string.lower(raw), "^%s*(/?)%s*([%w%-]+)")
-		if bare == nil then
-			continue
-		end
-		local closing = slash == "/"
-		if not closing and (bare == "script" or bare == "style") then
-			-- Skip to the end of the closing tag; a cut that lands inside it (or no closing tag at
-			-- all) ends the walk or resumes after the opening tag, never past the source.
-			local close = string.find(lower, "</" .. bare, gt, true)
-			if close then
-				local close_gt = string.find(inner, ">", close, true)
-				pos = if close_gt then close_gt + 1 else #inner + 1
+	local function marker(of: string): string
+		if of == "li" then
+			local list = lists[#lists]
+			if list and list.ordered then
+				list.n += 1
+				return "\2" .. list.n .. "\3"
 			end
-		elseif bare == "img" and not closing then
-			images += 1
-			if images <= ARTICLE_IMAGES_MAX then
-				local attrs = decode_attrs("<" .. raw .. ">", true)
-				local src = trim(attrs.src or "")
-				-- Only absolute http(s) without whitespace is fetchable: `javascript:`, `data:` and
-				-- friends would each raise in tern.fetch.
-				local abs = if src ~= "" then url.resolve(base, src) else ""
-				if string.find(abs, "^[hH][tT][tT][pP][sS]?://[^%s/?#]") and not string.find(abs, "%s") then
+			return "\1"
+		end
+		return "\4" .. string.sub(of, 2, 2) .. "\3"
+	end
+
+	walk(inner, lower, false, function(from: number, to: number): boolean?
+		if skip_depth > 0 then
+			return nil
+		end
+		local text = decode_entities(cut(string.sub(inner, from, math.min(to, from + READ_MAX)), READ_MAX))
+		text = string.gsub(text, "[\1-\5]", "")
+		if not string.find(text, "%S") then
+			text = " " -- the newlines and indentation between tags mean nothing
+		end
+		if in_heading then
+			text = string.gsub(text, "%s+", " ")
+		end
+		if pending ~= nil then
+			text = string.gsub(text, "\194\160", " ")
+			local first = string.find(text, "%S")
+			if first == nil then
+				return nil
+			end
+			text = string.sub(text, first)
+			table.insert(buf, "\n" .. marker(pending))
+			pending = nil
+		end
+		table.insert(buf, md_escape(text))
+		queued += #text
+		done = total > ARTICLE_TEXT_MAX or queued > READ_MAX
+		return done
+	end, function(name: string, closing: boolean, lt: number, gt: number): number?
+		if done or total > ARTICLE_TEXT_MAX then
+			return math.huge
+		end
+		if skip_depth > 0 then
+			if name == skip_name then
+				skip_depth += if closing then -1 else 1
+			end
+			return nil
+		end
+		if furniture and not closing and FURNITURE[name] and not (name == "header" and kind == "article") then
+			skip_name, skip_depth, dropped = name, 1, true
+			return nil
+		end
+		local heading = string.match(name, "^h[1-6]$") ~= nil
+		if closing then
+			if name == "li" then
+				pending = nil
+			elseif heading then
+				if pending == name then
+					pending = nil
+				end
+				in_heading = false
+				flush()
+				table.insert(buf, "\n\n")
+			elseif name == "ul" or name == "ol" then
+				table.remove(lists)
+				pending = nil
+				flush()
+				table.insert(buf, "\n\n")
+			elseif name == "blockquote" then
+				flush()
+				quotes = math.max(0, quotes - 1)
+				table.insert(buf, "\n\n")
+			elseif CLOSE_BREAK[name] then
+				flush()
+				table.insert(buf, CLOSE_BREAK[name])
+			elseif name == "tr" then
+				table.insert(buf, "\5\n")
+			elseif name == "dd" or name == "dt" then
+				table.insert(buf, "\n")
+			end
+			return nil
+		end
+		if heading then
+			flush()
+			pending = name
+			in_heading = true
+		elseif name == "li" then
+			trim_tail()
+			pending = "li"
+		elseif name == "ul" or name == "ol" then
+			table.insert(lists, { ordered = name == "ol", n = 0 })
+			table.insert(buf, "\n")
+		elseif name == "blockquote" then
+			flush()
+			quotes += 1
+		elseif name == "br" then
+			table.insert(buf, "\5\n")
+		elseif name == "tr" then
+			cells = 0
+		elseif name == "td" or name == "th" then
+			if cells > 0 then
+				table.insert(buf, " \\| ") -- an escaped pipe, as md_escape writes a page's own
+			end
+			cells += 1
+		elseif OPEN_BREAK[name] then
+			table.insert(buf, OPEN_BREAK[name])
+		elseif name == "img" then
+			if images < ARTICLE_IMAGES_MAX and gt - lt < TAG_MAX then
+				local attrs = decode_attrs(string.sub(inner, lt, gt), true)
+				local src = image_src(attrs, base, private_ok)
+				if src then
+					images += 1
+					pending = nil
 					flush()
 					table.insert(blocks, {
 						kind = "img",
-						src = abs,
+						src = src,
 						alt = collapse(attrs.alt or ""),
-						w = tonumber(attrs.width),
-						h = tonumber(attrs.height),
+						w = dimension(attrs.width),
+						h = dimension(attrs.height),
 					})
 				end
 			end
-		else
-			local left = BREAKS_HTML["<" .. bare]
-			local right = BREAKS_HTML["</" .. bare]
-			if bare == "li" then
-				-- A list item is Markdown's "- ", on its own line, so ui.md draws a real list.
-				if not closing then
-					table.insert(buf, "\n- ")
+		elseif name == "pre" then
+			pending = nil
+			flush()
+			local close = string.find(lower, "</pre", gt + 1, true)
+			local text = pre_text(string.sub(inner, gt + 1, if close then close - 1 else #inner))
+			if string.find(text, "%S") then
+				local code = fenced(text)
+				if quotes > 0 then
+					code = quote_lines(code)
 				end
-			elseif not closing and left then
-				table.insert(buf, left)
-			elseif closing and right then
-				flush()
-				table.insert(buf, right)
-			elseif not closing and string.match(bare, "^h[1-6]$") then
-				flush()
-				table.insert(buf, string.rep("#", tonumber(string.sub(bare, 2, 2)) :: number) .. " ")
+				total += #code
+				table.insert(blocks, { kind = "md", text = code })
 			end
+			local close_gt = if close then string.find(inner, ">", close, true) else nil
+			return if close_gt then close_gt + 1 else math.huge
 		end
-	end
+		return nil
+	end)
 	flush()
 
 	-- The cap applies to what ships, blocks and text alike: cut the block that crosses it and drop
@@ -1184,7 +1646,26 @@ function feed.article(body: string, base: string): Article
 		used += #part
 		table.insert(text_parts, part)
 	end
-	return { blocks = blocks, text = table.concat(text_parts, "\n") }
+	return { blocks = blocks, text = table.concat(text_parts, "\n") }, dropped
+end
+
+-- The article in `body` (an HTML page, `content_type` its Content-Type header), read for the
+-- native reader: the container's content as interleaved Markdown and image blocks, in document
+-- order, plus the whole text for the "is there anything here" check. `blocks` is empty when
+-- nothing useful came out, and the caller falls back to the browser. Linear in the page: the
+-- container scan and the walk each read it once (see `walk`).
+function feed.article(body: string, base: string, content_type: string?): Article
+	local html = page_utf8(cut(body, ARTICLE_SOURCE_MAX), content_type)
+	local kind, inner = article_container(html, string.lower(html))
+	if inner == "" then
+		return { blocks = {}, text = "" }
+	end
+	local article, dropped = render(inner, kind, base, true)
+	if dropped and #article.text < ARTICLE_MIN_TEXT then
+		-- Furniture swallowed the page (an ASP.NET page wraps everything in one <form>): read it whole.
+		article = render(inner, kind, base, false)
+	end
+	return article
 end
 
 return feed

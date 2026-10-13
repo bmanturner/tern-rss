@@ -145,45 +145,6 @@ local function cache_path(id: string): string
 	return DIR .. "/cache/" .. id .. ".json"
 end
 
--- Whether `u` points at this machine or a private network: localhost names, loopback, private and
--- link-local IPv4 (including unusual numeric spellings), and IPv6 loopback, unique-local and link-local.
-local function is_private(u: string): boolean
-	local host = string.lower(url.host(u))
-	if host == "localhost" or host == "localhost." or string.find(host, "%.localhost%.?$") ~= nil then
-		return true
-	end
-	local v6 = string.match(host, "^%[(.*)%]$")
-	if v6 then
-		local mapped = string.match(v6, "^::ffff:(%d+%.%d+%.%d+%.%d+)$")
-		if mapped == nil then
-			return v6 == "::1"
-				or v6 == "::"
-				or string.find(v6, "^f[cd]") ~= nil
-				or string.find(v6, "^fe[89ab]") ~= nil
-		end
-		host = mapped
-	end
-	if string.find(host, "^%d+$") or string.find(host, "^0x%x+$") then
-		return true
-	end
-	local a, b, c, d = string.match(host, "^(%d+)%.(%d+)%.(%d+)%.(%d+)%.?$")
-	if a == nil or b == nil or c == nil or d == nil then
-		return false
-	end
-	for _, part in { a, b, c, d } do
-		if #part > 1 and string.sub(part, 1, 1) == "0" then
-			return true -- octal spelling
-		end
-	end
-	local x, y = tonumber(a) :: number, tonumber(b) :: number
-	return x == 0
-		or x == 10
-		or x == 127
-		or (x == 172 and y >= 16 and y <= 31)
-		or (x == 192 and y == 168)
-		or (x == 169 and y == 254)
-end
-
 -- Files ---------------------------------------------------------------------------------------------
 
 local function read_file(path: string): string?
@@ -1309,7 +1270,7 @@ function store.add(input: string, cb: (feed: Feed?, err: string?, why: AddFailur
 	end
 	local host = url.host(u)
 	-- Addresses the page picks may reach this machine or the local network only when the user's own does.
-	local local_ok = is_private(u)
+	local local_ok = url.is_private(u)
 
 	local function follow(final: string, r: FetchResult, parsed: feed.Parsed)
 		local id = feed.hash(final)
@@ -1358,7 +1319,7 @@ function store.add(input: string, cb: (feed: Feed?, err: string?, why: AddFailur
 		if page_error == nil then
 			if feed.is_html(res.body, (res.headers or {})["content-type"]) then
 				for _, link in feed.links(res.body, u) do
-					if local_ok or not is_private(link) then
+					if local_ok or not url.is_private(link) then
 						table.insert(candidates, link)
 					end
 				end
@@ -1432,7 +1393,7 @@ local function handle_answer(s: Search, n: number, answer: { [string]: any })
 	end
 	-- Carly read the site's pages, so her answer may point where the page wanted: keep it off this
 	-- machine and the local network unless the site itself is there.
-	if is_private(feed_url) and not is_private(s.site) then
+	if url.is_private(feed_url) and not url.is_private(s.site) then
 		result(id, n, false, nil, "That address is on this machine or a private network; find the site's public feed URL.")
 		return
 	end

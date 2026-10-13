@@ -1,6 +1,6 @@
 --!strict
--- URL helpers: percent-encoding, user-input normalization, host display and relative-reference
--- resolution. Both halves.
+-- URL helpers: percent-encoding, user-input normalization, host display, private-address test and
+-- relative-reference resolution. Both halves.
 
 local url = {}
 
@@ -52,6 +52,45 @@ function url.host(u: string): string
 		return u
 	end
 	return host
+end
+
+-- Whether `u` points at this machine or a private network: localhost names, loopback, private and
+-- link-local IPv4 (including unusual numeric spellings), and IPv6 loopback, unique-local and link-local.
+function url.is_private(u: string): boolean
+	local host = string.lower(url.host(u))
+	if host == "localhost" or host == "localhost." or string.find(host, "%.localhost%.?$") ~= nil then
+		return true
+	end
+	local v6 = string.match(host, "^%[(.*)%]$")
+	if v6 then
+		local mapped = string.match(v6, "^::ffff:(%d+%.%d+%.%d+%.%d+)$")
+		if mapped == nil then
+			return v6 == "::1"
+				or v6 == "::"
+				or string.find(v6, "^f[cd]") ~= nil
+				or string.find(v6, "^fe[89ab]") ~= nil
+		end
+		host = mapped
+	end
+	if string.find(host, "^%d+$") or string.find(host, "^0x%x+$") then
+		return true
+	end
+	local a, b, c, d = string.match(host, "^(%d+)%.(%d+)%.(%d+)%.(%d+)%.?$")
+	if a == nil or b == nil or c == nil or d == nil then
+		return false
+	end
+	for _, part in { a, b, c, d } do
+		if #part > 1 and string.sub(part, 1, 1) == "0" then
+			return true -- octal spelling
+		end
+	end
+	local x, y = tonumber(a) :: number, tonumber(b) :: number
+	return x == 0
+		or x == 10
+		or x == 127
+		or (x == 172 and y >= 16 and y <= 31)
+		or (x == 192 and y == 168)
+		or (x == 169 and y == 254)
 end
 
 -- `href` resolved against `base` (no ".." normalization). "?query" keeps the base path, "#frag" the
