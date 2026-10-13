@@ -103,6 +103,10 @@ local statuses: { [string]: Status } = {}
 local next_at: { [string]: number } = {}
 local inflight: { [string]: boolean } = {}
 local inflight_n = 0
+-- Feeds whose retarget probe is out, by id.
+local retargeting: { [string]: boolean } = {}
+-- Old id -> the id a retarget gave that feed, so a block that still holds the old id can follow it.
+local rekeyed: { [string]: string } = {}
 local items_memo: { Item }? = nil
 local read_timer: TimerHandle? = nil
 local subscribers: { [number]: Subscriber } = {}
@@ -270,7 +274,9 @@ local function parse_feed_record(v: any): Feed?
 	end
 	local u: string = v.url
 	return {
-		id = if type(v.id) == "string" then v.id else feed.hash(u),
+		-- The id names the cache file, so only the hex hash main writes is trusted; anything else is
+		-- the hash of the URL.
+		id = if type(v.id) == "string" and string.find(v.id, "^%x+$") then v.id else feed.hash(u),
 		url = u,
 		title = nonempty(opt_string(v.title)) or url.host(u),
 		site = opt_string(v.site),
@@ -321,16 +327,23 @@ local function parse_cache(v: any): Cache?
 	}
 end
 
-local function load_feeds()
+-- Whether the subscription list is trustworthy: false when feeds.json exists but couldn't be read or
+-- decoded. The empty list is then not the user's, and nothing derived from it (the group prune) may
+-- be written back.
+local function load_feeds(): boolean
+	local ok, exists = pcall(tern.fs.exists, FEEDS_PATH)
+	if not ok or not exists then
+		return true
+	end
 	local text = read_file(FEEDS_PATH)
 	if not text then
-		return
+		return false
 	end
 	local data = decode(text)
 	if type(data) ~= "table" or (data.feeds ~= nil and type(data.feeds) ~= "table") then
 		write_text(FEEDS_PATH .. ".bad", text)
 		tern.log.warn("tern-rss store: feeds.json unreadable; saved as feeds.json.bad")
-		return
+		return false
 	end
 	local seen: { [string]: boolean } = {}
 	for _, v in ipairs(data.feeds or {}) do
@@ -340,6 +353,7 @@ local function load_feeds()
 			table.insert(feeds_list, f)
 		end
 	end
+	return true
 end
 
 local function load_read()
@@ -429,12 +443,13 @@ local function ensure_loaded()
 		return
 	end
 	loaded = true
-	load_feeds()
+	local feeds_ok = load_feeds()
 	load_read()
 	load_filter()
 	-- A group no feed carries any more (feeds.json edited by hand, or a crash between the two writes)
-	-- must not keep hiding every post.
-	if filter.prune(filter_cfg, folder_set()) then
+	-- must not keep hiding every post. Not against a list that failed to load: that one is empty, and
+	-- pruning it would erase the user's groups for good.
+	if feeds_ok and filter.prune(filter_cfg, folder_set()) then
 		save_filter()
 	end
 	local iv = interval()
@@ -978,6 +993,11 @@ function store.folders(): { string }
 		if a_ungrouped ~= b_ungrouped then
 			return b_ungrouped
 		end
+		-- Case-insensitive, so "ai" and "AI" sit together; the exact name breaks ties.
+		local la, lb = string.lower(a), string.lower(b)
+		if la ~= lb then
+			return la < lb
+		end
 		return a < b
 	end)
 	return out
@@ -1003,7 +1023,7 @@ function store.set_folder(id: string, name: string?): boolean
 	if not f then
 		return false
 	end
-	local want = string.match(name or "", "^%s*(.-)%s*$") or ""
+	local want = fmt.trim(name or "")
 	local g: string? = if want == "" then nil else fmt.clip(want, 60)
 	if f.folder == g then
 		return true
@@ -1128,11 +1148,28 @@ local function probe(candidates: { string }, done: (target: string?, r: FetchRes
 	launch()
 end
 
+-- The id `id` has become after retargets, or `id` itself when it never moved.
+function store.resolve(id: string): string
+	local at = id
+	-- Ids never form a cycle (a retarget clears its new id's own entry); the bound only guards a bug.
+	for _ = 1, 64 do
+		local nxt = rekeyed[at]
+		if nxt == nil then
+			break
+		end
+		at = nxt
+	end
+	return at
+end
+
 -- Renames `id` to `title` and moves it to `url`. Empty strings mean "leave as it is", so a feed can
 -- be renamed without refetching and retargeted without renaming; only a title that differs from the
--- current one counts as the user's own. A new URL is normalized like an added one and probed: `done`
--- gets the error when it isn't a feed or another feed already follows it, and the feed keeps its old
--- URL. A retarget is a different feed, so on success its cached posts go and it takes the new URL's
+-- current one counts as the user's own. A URL that is the feed's own, as stored or once normalized, is
+-- no retarget. A new URL is normalized like an added one and probed (it must itself be a feed; the
+-- page discovery of store.add is not run): `done` gets the error when it isn't a feed or another feed
+-- already follows it, and then nothing changes, the title included: a title typed with a retarget
+-- lands only with it. One retarget at a time per feed: a second while the probe is out gets an
+-- error. A retarget is a different feed, so on success its cached posts go and it takes the new URL's
 -- hash as its id (store.add finds duplicates by that hash); `done` gets that id. Returns false when
 -- there is no such feed or nothing to change.
 function store.rename(id: string, title: string, target: string, done: (err: string?, new_id: string?) -> ()): boolean
@@ -1146,26 +1183,35 @@ function store.rename(id: string, title: string, target: string, done: (err: str
 	want = if want then fmt.clip(want, 200) else nil
 	local to: string? = nil
 	local typed = nonempty(target)
-	if typed then
+	-- Stored URLs aren't always normalized (a page's link keeps its scheme case and inner spaces), and
+	-- the edit field prefills the stored text: the same text, or the same once normalized, is no change.
+	if typed and typed ~= f.url then
 		to = url.normalize(typed)
 		if to == nil then
 			done("That doesn't look like a web address.")
 			return true
 		end
+		if to == f.url or to == url.normalize(f.url) then
+			to = nil
+		end
 	end
 	local retitle = want ~= nil and want ~= f.title
-	local retarget = to ~= nil and to ~= f.url
+	local retarget = to ~= nil
 	if not retitle and not retarget then
 		return false
 	end
 	if to ~= nil and retarget then
+		if retargeting[id] then
+			done("Still checking the last change to this feed. Try again in a moment.")
+			return true
+		end
 		local taken = url_taken(to, f)
 		if taken then
 			done(`You already follow {taken.title}.`)
 			return true
 		end
 	end
-	if retitle and want then
+	if retitle and want and not retarget then
 		f.title = want
 		f.title_set = true
 		items_memo = nil
@@ -1182,12 +1228,16 @@ function store.rename(id: string, title: string, target: string, done: (err: str
 	-- the poller doesn't fetch the old URL meanwhile and merge its posts after the switch.
 	local before = statuses[id]
 	statuses[id] = { state = "loading" }
+	retargeting[id] = true
 	notify()
 	local dest: string = to
 	probe({ dest }, function(hit: string?, r: FetchResult?, parsed: feed.Parsed?)
+		retargeting[id] = nil
 		local again = find(id)
 		if again == nil then
-			return -- Removed while the probe was out.
+			-- Removed while the probe was out; the caller's field is still waiting on an answer.
+			done("That feed is gone.")
+			return
 		end
 		local function refuse(message: string)
 			-- The feed itself is as healthy as it was; the message goes to the caller.
@@ -1210,6 +1260,12 @@ function store.rename(id: string, title: string, target: string, done: (err: str
 		next_at[id] = nil
 		again.url = dest
 		again.id = new_id
+		rekeyed[new_id] = nil
+		rekeyed[id] = new_id
+		if retitle and want then
+			again.title = want
+			again.title_set = true
+		end
 		items_memo = nil
 		apply(again, parsed, r)
 		-- The URL and id changed, so this write is not optional: apply() only reports the title.
