@@ -275,18 +275,19 @@ end
 -- Which kind of row a panel line is.
 type RowKind = "read" | "all" | "group" | "rule"
 
-type PanelRow = { kind: RowKind, name: string?, index: number? }
+-- `key` is the row's key in the list, which is what a click reports back.
+type PanelRow = { kind: RowKind, key: string, name: string?, index: number? }
 
 local function panel_rows(): { PanelRow }
 	local rows: { PanelRow } = {
-		{ kind = "read", name = nil, index = nil },
-		{ kind = "all", name = nil, index = nil },
+		{ kind = "read", key = "read", name = nil, index = nil },
+		{ kind = "all", key = "all", name = nil, index = nil },
 	}
 	for _, name in store.folders() do
-		table.insert(rows, { kind = "group", name = name, index = nil })
+		table.insert(rows, { kind = "group", key = "g:" .. name, name = name, index = nil })
 	end
 	for i = 1, #store.filter().rules do
-		table.insert(rows, { kind = "rule", name = nil, index = i })
+		table.insert(rows, { kind = "rule", key = "r" .. i, name = nil, index = i })
 	end
 	return rows
 end
@@ -316,8 +317,6 @@ local function describe_filter(cfg: filter.Config): string
 	return if #out == 0 then "off" else table.concat(out, " · ")
 end
 
--- Space checks a group, `x` excludes it. Checking a group is what keeps it in the Latest tab; with
--- nothing checked every group is in. A group is never both, and space on the top row unchecks all.
 -- Space checks a group, `x` excludes it. Checking a group is what keeps it in the Latest tab; with
 -- nothing checked every group is in. A group is never both, and space on the all-groups row unchecks
 -- them all. The read row steps a single cycle instead: every post, unread only, read only.
@@ -863,8 +862,14 @@ end
 
 -- Marks every post the tab shows read, or unread when they all already are, in one write. This is
 -- what follows a read filter: narrow Latest to unread, then clear the list with one key.
-local function toggle_all_read(state: State): boolean
-	local rows = headlines(state, state.tab)
+local function toggle_all_read(state: State, cx: BlockCx): boolean
+	local latest = if state.tab == "latest" then judge(state) else UNFILTERED
+	if latest.pending > 0 then
+		-- Marking what has been judged so far would leave the rest unmarked without saying so.
+		cx:toast("info", "Still filtering the list", "Try again in a moment")
+		return true
+	end
+	local rows = shown_items(state.tab, latest)
 	if #rows == 0 then
 		return false
 	end
@@ -1127,6 +1132,22 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node }, latest
 					key = "empty-hint",
 				})
 			)
+		elseif state.tab == "latest" and latest.pending > 0 then
+			table.insert(parts, ui.node("spinner", { key = "empty", style = "dots", label = "Filtering your posts…" }))
+		elseif state.tab == "latest" and latest.hidden > 0 then
+			-- Not "no headlines": there are posts, and the filter (unread only, by default) is
+			-- what keeps them off the list.
+			table.insert(
+				parts,
+				cards.with(
+					ui.text({
+						span(plural(latest.hidden, "post", "posts") .. " hidden by the filter. Press ", "muted"),
+						span("f", "key"),
+						span(" to edit it.", "muted"),
+					}),
+					{ key = "empty" }
+				)
+			)
 		elseif store.busy() > 0 then
 			table.insert(parts, ui.node("spinner", { key = "empty", style = "dots", label = "Fetching your feeds…" }))
 		else
@@ -1224,14 +1245,12 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 		)
 	)
 	local children: { Node } = {}
-	local keys: { string } = {}
-	for i, row in rows do
+	for _, row in rows do
 		if row.kind == "read" then
-			table.insert(keys, "read")
 			table.insert(
 				children,
 				ui.node("item", {
-					key = "read",
+					key = row.key,
 					label = {
 						span(if cfg.read == "all" then "☑" else "☐", if cfg.read == "all" then "accent" else "muted"),
 						span(" "),
@@ -1242,11 +1261,10 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 				})
 			)
 		elseif row.kind == "all" then
-			table.insert(keys, "all")
 			table.insert(
 				children,
 				ui.node("item", {
-					key = "all",
+					key = row.key,
 					label = {
 						span(if next(cfg.groups) == nil then "☑" else "☐", "accent"),
 						span(" "),
@@ -1259,7 +1277,6 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 		elseif row.kind == "group" then
 			local name = row.name :: string
 			local feeds = store.feeds_in(name)
-			table.insert(keys, "g:" .. name)
 			local marks: { Span | string } = {
 				span(if cfg.groups[name] then "☑" else "☐", if cfg.groups[name] then "accent" else "muted"),
 				span(" "),
@@ -1271,7 +1288,7 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 			table.insert(
 				children,
 				ui.node("item", {
-					key = "g:" .. name,
+					key = row.key,
 					label = marks,
 					detail = plural(#feeds, "feed", "feeds"),
 					value = { span("space · x", "muted") },
@@ -1282,11 +1299,10 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 			local rule = cfg.rules[index]
 			if rule and rule.broken then
 				-- Kept in its place and written back as it was; it does nothing until fixed or deleted.
-				table.insert(keys, "r" .. index)
 				table.insert(
 					children,
 					ui.node("item", {
-						key = "r" .. index,
+						key = row.key,
 						label = { span(tostring(index) .. " ", "num"), span("⚠ " .. rule.raw, "warning") },
 						detail = "not applied: " .. rule.broken,
 						value = { span("K/J · d", "muted") },
@@ -1294,11 +1310,10 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 				)
 			elseif rule then
 				local where = if rule.scope.kind == "all" then "every feed" else filter.scope_text(rule.scope)
-				table.insert(keys, "r" .. index)
 				table.insert(
 					children,
 					ui.node("item", {
-						key = "r" .. index,
+						key = row.key,
 						label = {
 							span(tostring(index) .. " ", "num"),
 							span(if rule.drop then "" else "keep ", if rule.drop then "muted" else "accent"),
@@ -1315,7 +1330,7 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 		parts,
 		ui.node("list", {
 			key = "filter",
-			selected = "main.filter." .. (keys[at] or "all"),
+			selected = "main.filter." .. rows[at].key,
 			max = { lines = rows_fitting(cx.rows - 12, 4) },
 		}, children)
 	)
@@ -1817,9 +1832,13 @@ local rss: BlockDef<State> = {
 				return true
 			end
 		end
-		-- The filter panel takes the keys while it is up on the Latest tab.
+		-- The filter panel takes the keys while it is up on the Latest tab, except the ones that
+		-- leave it or refresh: switching tabs and `r` work from the panel too.
 		if state.panel and state.tab == "latest" then
-			return panel_key(state, k, cx)
+			local through = n == "1" or n == "2" or n == "3" or n == "tab" or (n == "r" and not k.shift)
+			if not through then
+				return panel_key(state, k, cx)
+			end
 		end
 		if n == "paste" then
 			local u = url.normalize(k.text or "")
@@ -1872,7 +1891,7 @@ local rss: BlockDef<State> = {
 			if state.tab == "feeds" then
 				return false
 			end
-			return toggle_all_read(state)
+			return toggle_all_read(state, cx)
 		elseif n == "u" and not k.shift then
 			return undo_catch_up(state)
 		end
@@ -1919,11 +1938,7 @@ local rss: BlockDef<State> = {
 			local key = strip_prefix(ev.item, "main.filter.")
 			if key then
 				for i, row in panel_rows() do
-					local row_key = if row.kind == "rule"
-						then "r" .. tostring(row.index)
-						elseif row.kind == "group" then "g:" .. (row.name or "")
-						else "all"
-					if row_key == key then
+					if row.key == key then
 						state.panel_at = i
 						break
 					end
