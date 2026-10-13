@@ -6,14 +6,18 @@
 -- A page it can't read (error, non-HTML, too little text) is handed to Tern's browser through the
 -- window's `tern-rss://browser` route, and this pane closes so the browser takes its place.
 --
--- Launch arguments: the article URL, then the RSS pane the reader sits beside (so the browser can
--- take over beside it). Later articles arrive through the per-pane target file below. The window's
--- plugin manifest declares this block with palette = false, so the window route is its only caller.
+-- Launch arguments: the article URL, the RSS pane the reader sits beside (so the browser can take
+-- over beside it) and the number of the click that opened it. Later articles arrive through the
+-- RSS block's target file for that pane (lib/target.luau), which this block polls: the RSS block
+-- records every click there before it opens the link, so the reader follows the latest click even
+-- when it was opened for an earlier one. The window's plugin manifest declares this block with
+-- palette = false, so the window route is its only caller.
 
 local feed = require("../lib/feed")
 local url = require("../lib/url")
 local fmt = require("../lib/fmt")
 local poll = require("../lib/poll")
+local target_file = require("../lib/target")
 
 local ui = tern.ui
 
@@ -36,15 +40,23 @@ type State = {
 	gen: number,
 }
 
+-- An image bigger than this isn't forwarded to the window (tern.fetch reads up to 16 MiB of any
+-- response), so one article can't push more than 12 times this.
+local IMAGE_BYTES_MAX = 4 * 1024 * 1024
+-- How often the block checks its target file (and that its pane still exists).
+local POLL_MS = 500
+
 -- Fetches one image and stores its blob id, then renders. Failures mark the source as "" and the
--- view draws its alt text instead. A source tern.fetch refuses (it raises) is one such failure.
-local function fetch_image(state: State, cx: BlockCx, src: string, gen: number)
+-- view draws its alt text instead: a source tern.fetch refuses (it raises), a bad status, an
+-- empty or oversized body, or anything that isn't served as an image. `alive` says whether the
+-- pane is still there to draw into.
+local function fetch_image(state: State, cx: BlockCx, src: string, gen: number, alive: () -> boolean)
 	local blobs = state.blobs
 	if blobs == nil or blobs[src] ~= nil then
 		return
 	end
 	local function settle(id: string)
-		if state.gen ~= gen then
+		if state.gen ~= gen or not alive() then
 			return
 		end
 		blobs[src] = id
@@ -55,11 +67,15 @@ local function fetch_image(state: State, cx: BlockCx, src: string, gen: number)
 			return
 		end
 		local bytes = if r and r.status < 400 and r.error == nil then r.body else nil
-		local mime = if r then ((r.headers or {})["content-type"] or "image/png") else "image/png"
+		local mime = if r then string.match(string.lower((r.headers or {})["content-type"] or ""), "^%s*([^;%s]+)") else nil
+		if bytes == nil or #bytes == 0 or #bytes > IMAGE_BYTES_MAX or mime == nil or not string.find(mime, "^image/") then
+			settle("")
+			return
+		end
 		local blob_ok, id = pcall(function()
-			return cx:blob(bytes or "", mime)
+			return cx:blob(bytes, mime :: string)
 		end)
-		settle(if blob_ok and bytes and #bytes > 0 then (id :: string) else "")
+		settle(if blob_ok then (id :: string) else "")
 	end)
 	if not ok then
 		settle("")
@@ -86,49 +102,77 @@ local function pull_title(blocks: { feed.ArticleBlock }): string?
 	return nil
 end
 
--- Where the window half points a running reader at the next article: it writes
--- `reader-<pane>.json` ({"url": …}) and the block re-reads on change. One file per reader pane, so
--- every reader follows only its own clicks.
-local TARGET_DIR = tern.plugin.data
--- How often the block checks its file (and that its pane still exists).
-local POLL_MS = 500
-
-local function target_path(pane: number): string
-	return `{TARGET_DIR}/reader-{pane}.json`
-end
-
 local reader: BlockDef<State> = {
 	init = function(cx: BlockCx, args: { string }, _saved)
-		local target = if #args > 0 then url.normalize(args[1]) else nil
-		if target == nil then
-			return { target = "", phase = "fallback", error = "No article URL.", gen = 0 }
+		local raw = args[1] or ""
+		local owner = tonumber(args[2])
+		local state: State = { target = raw, phase = "fetching", gen = 0 }
+		-- The newest click this reader has applied. A click is anything the target file holds
+		-- under another number; a reader opened by a hand-made link (no number) starts from
+		-- whatever the file holds now, which is an older click's.
+		local launched = tonumber(args[3])
+		local seen_seq: number
+		if launched then
+			seen_seq = launched
+		else
+			local latest = if owner then target_file.read(owner) else nil
+			seen_seq = if latest then latest.seq else 0
 		end
-		local owner = if args[2] then tonumber(args[2]) else nil
-		local state: State = { target = target, phase = "fetching", gen = 0 }
-		local path = target_path(cx.pane)
+
+		-- Whether this pane still exists; once it doesn't, nothing here renders or opens anything
+		-- (the window may have closed it for a newer article while a fetch was out). Checked once
+		-- per callback, and the answer sticks: a late callback finds every gen stale. A pane the
+		-- host hasn't listed yet (init runs first) is taken to exist until it has been seen once.
+		local stopped = false
+		local seen_pane = false
+		local settled = false -- init has returned: every later call is a callback or a tick
+		local function alive(): boolean
+			if stopped then
+				return false
+			end
+			local ok, here = pcall(poll.alive, cx.pane)
+			if ok and here then
+				seen_pane = true
+			elseif ok and (seen_pane or settled) then
+				stopped = true
+				state.gen += 1
+				return false
+			end
+			return true
+		end
+
+		-- Declared ahead: handing off first looks for a newer click, which loads it.
+		local check_target: (handing: boolean) -> boolean
+		local handed = false
 
 		-- Hands the article to Tern's browser, once, and closes this pane: the window's browser
-		-- route docks it where the reader sat. With no RSS pane to dock beside (a reader launched
-		-- by hand), Tern's own link handling opens it.
-		local handed = false
+		-- route docks it where the reader sat, and only accepts it from this pane, so a reader the
+		-- window has already replaced can't pull the browser away from the user's last click. With
+		-- no RSS pane to dock beside (a reader launched by hand), Tern's own link handling opens it.
+		-- A click that arrived since the page was requested names another article: that one is
+		-- shown instead.
 		local function hand_off(why: string)
+			if handed or not alive() then
+				return
+			end
+			if check_target(true) then
+				return
+			end
 			state.phase = "fallback"
 			state.error = why
 			cx:render()
-			if handed then
-				return
-			end
 			handed = true
-			if owner then
-				cx:open(`tern-rss://browser/{owner}?url={url.encode(state.target)}`)
-			else
-				cx:open(state.target)
+			if string.find(state.target, "^https?://") then
+				if owner then
+					cx:open(`tern-rss://browser/{owner}?from={cx.pane}&url={url.encode(state.target)}`)
+				else
+					cx:open(state.target)
+				end
 			end
-			pcall(tern.fs.remove, path)
 			cx:exit(0)
 		end
 
-		-- Loads `at` into `state`, from a clean slate, and re-renders.
+		-- Loads `at` (a normalized URL) into `state`, from a clean slate, and re-renders.
 		local function load(at: string)
 			state.gen += 1
 			local gen = state.gen
@@ -139,12 +183,10 @@ local reader: BlockDef<State> = {
 			state.blobs = {}
 			state.error = nil
 			cx:render()
-			-- A fetch for an article the user has since moved past must not draw over the new one.
-			local function current(): boolean
-				return state.gen == gen
-			end
 			local sent = pcall(tern.fetch, at, nil, function(r: FetchResult, _cx: WindowCx?)
-				if not current() then
+				-- A fetch for an article the user has since moved past, or for a pane that is
+				-- gone, must not draw over the new one or open anything.
+				if state.gen ~= gen or not alive() then
 					return
 				end
 				if r == nil or r.status >= 400 or r.error ~= nil then
@@ -160,7 +202,7 @@ local reader: BlockDef<State> = {
 					hand_off("That URL isn't an article page.")
 					return
 				end
-				local article = feed.article(r.body, at)
+				local article = feed.article(r.body, at, ctype)
 				if #article.text < 400 then
 					hand_off("Couldn't extract this page's text.")
 					return
@@ -171,7 +213,7 @@ local reader: BlockDef<State> = {
 				cx:render()
 				for _, b in article.blocks do
 					if b.kind == "img" and b.src then
-						fetch_image(state, cx, b.src, gen)
+						fetch_image(state, cx, b.src, gen, alive)
 					end
 				end
 			end)
@@ -180,37 +222,42 @@ local reader: BlockDef<State> = {
 			end
 		end
 
-		-- The window half names the next article in this pane's target file. A half-written file
-		-- fails to decode and is read again on the next tick.
-		local function check_target()
-			local ok, exists = pcall(tern.fs.exists, path)
-			if not (ok and exists) then
-				return
+		-- Reads the RSS block's target file for a click this reader hasn't applied. Returns whether
+		-- it took over (loaded another article, or handed one off) rather than left things as they
+		-- are. `handing`: called from hand_off, which carries on by itself unless this loaded a page;
+		-- an address that can't be fetched becomes the hand-off's own target then.
+		check_target = function(handing: boolean): boolean
+			if owner == nil or handed then
+				return false
 			end
-			local read_ok, text = pcall(tern.fs.read, path)
-			if not read_ok or text == nil then
-				return
+			local latest = target_file.read(owner)
+			if latest == nil or latest.seq == seen_seq then
+				return false
 			end
-			local decode_ok, doc = pcall(tern.json.decode, text)
-			if not decode_ok or type(doc) ~= "table" or type((doc :: any).url) ~= "string" then
-				return
+			seen_seq = latest.seq
+			local at = url.normalize(latest.url)
+			if at == nil then
+				state.target = latest.url
+				if not handing then
+					hand_off("That address can't be fetched.")
+				end
+				return not handing
 			end
-			local at = url.normalize((doc :: any).url)
-			if at ~= nil and at ~= state.target then
-				load(at)
+			if at == state.target then
+				return false
 			end
+			load(at)
+			return true
 		end
 
-		-- Re-arms until the pane is gone (blocks have no close hook), then removes its file. One
-		-- failed tick never stops the loop.
+		-- Re-arms until the pane is gone (blocks have no close hook). One failed tick never stops
+		-- the loop.
 		local warned = false
 		local function tick()
-			local alive_ok, alive = pcall(poll.alive, cx.pane)
-			if alive_ok and not alive then
-				pcall(tern.fs.remove, path)
+			if handed or not alive() then
 				return
 			end
-			local ok, err = pcall(check_target)
+			local ok, err = pcall(check_target, false)
 			if not ok and not warned then
 				warned = true
 				tern.log.warn("tern-rss reader: target check failed", err)
@@ -218,8 +265,16 @@ local reader: BlockDef<State> = {
 			tern.timer(POLL_MS, tick)
 		end
 
-		load(target)
-		tern.timer(POLL_MS, tick)
+		local first = if raw ~= "" then url.normalize(raw) else nil
+		if first == nil then
+			hand_off("That address can't be fetched.")
+		elseif not check_target(false) then
+			load(first)
+		end
+		if not handed then
+			tern.timer(POLL_MS, tick)
+		end
+		settled = true
 		return state
 	end,
 

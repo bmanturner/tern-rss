@@ -10,6 +10,7 @@ local fmt = require("../lib/fmt")
 local cards = require("../lib/cards")
 local filter = require("../lib/filter")
 local config = require("../lib/config")
+local target_file = require("../lib/target")
 
 local ui = tern.ui
 local span = ui.span
@@ -926,9 +927,13 @@ end
 -- Opens `link` for reading through the window's route: the native reader block (blocks/reader.luau)
 -- fetches the page itself and draws its text and images, and hands the page to Tern's browser when
 -- it can't read it. The window keeps one article pane per RSS pane, so a second article lands in
--- the same reading pane.
+-- the same reading pane. This block, not the window, is the source of truth for the click: it
+-- records it in the file the reader beside this pane polls (lib/target.luau) before it opens the
+-- link, and the link names the mode (this host's `reader` setting) and the click's number, so the
+-- window needs neither this host's files nor its settings.
 local function open_article(cx: BlockCx, link: string)
-	cx:open("tern-rss://read/" .. cx.pane .. "?url=" .. url.encode(link))
+	local seq = if string.find(link, "^https?://") then target_file.write(cx.pane, link) else 0
+	cx:open(`tern-rss://read/{cx.pane}?url={url.encode(link)}&seq={seq}&mode={config.reader_mode()}`)
 end
 
 local function visit(cx: BlockCx, item: store.Item)
@@ -1926,7 +1931,7 @@ local rss: BlockDef<State> = {
 			store.refresh_all()
 			return true
 		elseif n == "b" and not k.shift then
-			-- Shared by every RSS block (kv), so the window route sees it on the next click.
+			-- Shared by every RSS block on this host (kv); each click carries the mode to the window.
 			local to: config.ReaderMode = if config.reader_mode() == "browser" then "native" else "browser"
 			config.set_reader_mode(to)
 			cx:toast("info", if to == "browser" then "Articles open in Tern's browser" else "Articles open in the reader")
