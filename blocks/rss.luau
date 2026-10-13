@@ -399,7 +399,7 @@ local function panel_toggle(row: PanelRow, pressed: string): boolean
 end
 
 -- K and J move a rule, which changes the order the rules are read in.
-local function panel_move_rule(state: State, index: number, up: boolean): boolean
+local function panel_move_rule(state: State, index: number, up: boolean, at: number): boolean
 	local cfg = store.filter()
 	local to = if up then index - 1 else index + 1
 	if to < 1 or to > #cfg.rules then
@@ -407,7 +407,7 @@ local function panel_move_rule(state: State, index: number, up: boolean): boolea
 	end
 	table.insert(cfg.rules, to, table.remove(cfg.rules, index))
 	store.set_filter(cfg)
-	state.panel_at += if up then -1 else 1
+	state.panel_at = at + (if up then -1 else 1)
 	return true
 end
 
@@ -823,9 +823,9 @@ local function panel_key(state: State, k: Key, cx: BlockCx): boolean
 	local index = if row.kind == "rule" then row.index else nil
 	-- A rule row moves before navigation reads K and J as k and j.
 	if index and (n == "K" or (n == "k" and k.shift)) then
-		return panel_move_rule(state, index, true)
+		return panel_move_rule(state, index, true, at)
 	elseif index and (n == "J" or (n == "j" and k.shift)) then
-		return panel_move_rule(state, index, false)
+		return panel_move_rule(state, index, false, at)
 	end
 	local delta = nav_delta(k)
 	if delta then
@@ -838,6 +838,9 @@ local function panel_key(state: State, k: Key, cx: BlockCx): boolean
 	elseif n == "escape" or n == "f" then
 		state.panel = false
 		if state.adding then
+	-- The stored row can be out of range (a group vanished while the panel was open); the cursor
+	-- moves from the row that is drawn, so K and J keep it on the rule they moved.
+	state.panel_at = at
 			close_field(state, cx)
 		end
 		return true
