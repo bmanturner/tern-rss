@@ -4,7 +4,7 @@
 -- Articles: an RSS block opens one with cx:open("tern-rss://read/<pane>?url=<encoded>"). The route
 -- shows it in one article pane docked right of that RSS pane: the native reader block
 -- (blocks/reader.luau), reused for later articles and reopened when the user closed it, or Tern's
--- browser. A reader that can't read a page asks for the browser with
+-- browser when the `reader` setting (config/block/rss/reader) says "browser". A reader that can't read a page asks for the browser with
 -- "tern-rss://browser/<pane>?url=<encoded>", and the browser replaces it, so an RSS pane never has
 -- two article panes. The RSS pane rides in the URL because link.pane is the focused pane; any
 -- program can print such a link, so the routes dock only beside a real RSS block pane and leave
@@ -17,6 +17,7 @@
 local manifest = require("./lib/manifest")
 local url = require("./lib/url")
 local carly = require("./lib/carly")
+local config = require("./lib/config")
 
 -- RSS pane -> the article pane beside it, and what that pane is. Window state persists between
 -- route calls (observed); a pane that has since closed is noticed through the session, never
@@ -267,7 +268,8 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	if not is_rss_pane(cx, owner) then
 		return { url = target }
 	end
-	if route == "browser" then
+	-- The setting is read per click: the RSS block's `b` key flips it while this half runs on.
+	if route == "browser" or config.reader_mode() == "browser" then
 		show_browser(cx, owner, target)
 	else
 		show_reader(cx, owner, target)

@@ -9,6 +9,7 @@ local url = require("../lib/url")
 local fmt = require("../lib/fmt")
 local cards = require("../lib/cards")
 local filter = require("../lib/filter")
+local config = require("../lib/config")
 
 local ui = tern.ui
 local span = ui.span
@@ -1483,13 +1484,15 @@ end
 local function hints_text(state: State, cx: BlockCx, has_feeds: boolean, reserve: number): Node
 	local narrow = cx.cols < 70
 	local catch: { string } = if state.undo then { "u", "undo" } else { "shift+m", "catch up" }
+	-- Last on the tabs that have it, so it is the first hint to go when the bar is tight.
+	local reader: { string } = { "b", if config.reader_mode() == "browser" then "browser" else "reader" }
 	local pairs: { { string } }
 	if not has_feeds then
 		pairs = { { "enter", "follow" }, { "a", "add" }, { "j", "move" } }
 	elseif state.panel and state.tab == "latest" then
 		pairs = { { "space", "check" }, { "x", "exclude" }, { "a", "rule" }, { "K/J", "move" }, { "f", "close" } }
 	elseif state.tab == "feeds" then
-		pairs = { { "s", "star" }, { "t", "group" }, { "d", "remove" }, catch, { "a", "add" }, { "r", "refresh" } }
+		pairs = { { "s", "star" }, { "t", "group" }, { "e", "edit" }, { "d", "remove" }, catch, { "a", "add" }, { "r", "refresh" }, reader }
 	else
 		pairs = {
 			{ "enter", "open" },
@@ -1500,6 +1503,7 @@ local function hints_text(state: State, cx: BlockCx, has_feeds: boolean, reserve
 			{ "R", "read all" },
 			{ "a", "add" },
 			{ "r", "refresh" },
+			reader,
 		}
 	end
 	local gap = if narrow then 2 else 3
@@ -1771,6 +1775,12 @@ local rss: BlockDef<State> = {
 			return true
 		elseif n == "r" and not k.shift then
 			store.refresh_all()
+			return true
+		elseif n == "b" and not k.shift then
+			-- Shared by every RSS block (kv), so the window route sees it on the next click.
+			local to: config.ReaderMode = if config.reader_mode() == "browser" then "native" else "browser"
+			config.set_reader_mode(to)
+			cx:toast("info", if to == "browser" then "Articles open in Tern's browser" else "Articles open in the reader")
 			return true
 		end
 

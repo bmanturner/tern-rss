@@ -85,7 +85,7 @@ local READ_TTL_S = 180 * 86400
 local ACCEPT =
 	"application/rss+xml, application/atom+xml, application/rdf+xml;q=0.9, application/xml;q=0.8, text/xml;q=0.8, text/html;q=0.5, */*;q=0.1"
 
-local cfg = config.for_block("rss", { refresh_minutes = 15 })
+local cfg = config.rss()
 
 local DIR = tern.plugin.data .. "/rss"
 local FEEDS_PATH = DIR .. "/feeds.json"

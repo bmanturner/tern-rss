@@ -76,4 +76,31 @@ function config.for_block(name: string, defaults: Defaults): Namespace
 	return namespace("config/block/" .. name, table.clone(defaults))
 end
 
+-- The settings of the `rss` block, declared once: the host half (lib/store, blocks/rss) and the
+-- window half (window.luau) must read the same kv namespace with the same defaults.
+local RSS_DEFAULTS: Defaults = {
+	refresh_minutes = 15,
+	-- Where articles open: "native" is the reader block, "browser" is Tern's browser.
+	reader = "native",
+}
+local rss: Namespace? = nil
+
+function config.rss(): Namespace
+	if rss == nil then
+		rss = config.for_block("rss", RSS_DEFAULTS)
+	end
+	return rss :: Namespace
+end
+
+export type ReaderMode = "native" | "browser"
+
+-- Where articles open now; any stored value other than "browser" reads as "native".
+function config.reader_mode(): ReaderMode
+	return if config.rss().get("reader") == "browser" then "browser" else "native"
+end
+
+function config.set_reader_mode(mode: ReaderMode)
+	config.rss().set("reader", mode)
+end
+
 return config
