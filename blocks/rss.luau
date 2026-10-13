@@ -504,39 +504,31 @@ local function paragraphs(text: string): { string }
 	return out
 end
 
--- Splits the edit field into a title and a URL. A URL is whatever starts with a scheme, so the title
--- is the text before it; with no URL the whole line is the title. Both come back trimmed and empty
--- strings come back nil, which is what store.rename reads as "keep this one".
--- Splits the edit field into a title and a URL. The URL is the text from the first `scheme://`
--- that stands alone after a space (so `K.I.S.S` doesn't end in a fake scheme); with no URL the
--- whole line is the title. Both come back trimmed and empty strings come back nil, which is what
--- store.rename reads as "keep this one".
--- Splits the edit field into a title and a URL. The URL is the text from the first `scheme://`
--- that starts the line or follows a space, so `K.I.S.S` doesn't end in a fake scheme; with no URL
--- the whole line is the title. Both come back trimmed and empty strings come back nil, which is
--- what store.rename reads as "keep this one".
--- Splits the edit field into a title and a URL. The URL is the text from the first `scheme://`
--- that starts the line or follows a space, so the `.S` of `K.I.S.S` doesn't read as a scheme; with
--- no URL the whole line is the title. Both come back trimmed and empty strings come back nil, which
--- is what store.rename reads as "keep this one".
+-- Splits the edit field into a title and a URL; both come back trimmed, and empty strings come back
+-- nil, which is what store.rename reads as "keep this one". The URL is the text from the first
+-- `scheme://` that starts the line or follows a space (so the `.S` of `K.I.S.S` is no scheme). With
+-- no scheme, a final token that looks like `host.tld/path` still counts, so `Title example.com/feed`
+-- retargets; a dotted title such as `Node.js` has no path and stays a title. With neither, the whole
+-- line is the title.
 local function split_feed_fields(text: string): (string?, string?)
 	local s = string.match(text, "^%s*(.-)%s*$") or ""
 	if s == "" then
 		return nil, nil
 	end
-	-- `^[%w+.-]+://` or `%s[%w+.-]+://`: the scheme must start the line or follow a space, so a
-	-- title ending in letters never counts as one.
-	local head = string.find(s, "^[%w+.-]+://")
-	-- In the second case the space is matched too, so the URL starts one byte later.
-	local at = head or (function()
-		local space = string.find(s, "%s[%w+.-]+://")
-		return if space then space + 1 else nil
-	end)()
+	local at = string.find(s, "^[%w+.-]+://")
 	if at == nil then
-		return s, nil
+		-- The space is matched too, so the URL starts one byte later.
+		local space = string.find(s, "%s[%w+.-]+://")
+		at = if space then space + 1 else nil
 	end
-	-- `at` is the start of the URL, or the space in front of it in the second case, and the title is
-	-- everything before that either way.
+	if at == nil then
+		local token = string.match(s, "(%S+)$") or ""
+		local host, path = string.match(token, "^([%w-]+%.[%w.-]*%.?%a%a+)(/.+)$")
+		if host == nil or path == nil or string.find(host, "%.%.") or url.normalize(token) == nil then
+			return s, nil
+		end
+		at = #s - #token + 1
+	end
 	local title = string.match(string.sub(s, 1, at - 1), "^%s*(.-)%s*$")
 	local u = string.match(string.sub(s, at), "^%s*(.-)%s*$")
 	return if title == "" then nil else title, if u == "" then nil else u
@@ -665,9 +657,13 @@ local function submit_feed(state: State, cx: BlockCx, field: Field)
 		return
 	end
 	close_field(state, cx)
-	local ok = store.rename(target, title or "", u or "", function(err: string?)
+	local ok = store.rename(target, title or "", u or "", function(err: string?, new_id: string?)
+		-- A retarget re-keys the feed; the selection follows it or it would fall back to the first row.
+		if new_id and new_id ~= target and state.sel.feeds == target then
+			state.sel.feeds = new_id
+		end
 		if err then
-			cx:toast("error", "Couldn't read that feed", err)
+			cx:toast("error", "Couldn't update that feed", err)
 		else
 			cx:toast("success", "Updated")
 		end

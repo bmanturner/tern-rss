@@ -432,6 +432,11 @@ local function ensure_loaded()
 	load_feeds()
 	load_read()
 	load_filter()
+	-- A group no feed carries any more (feeds.json edited by hand, or a crash between the two writes)
+	-- must not keep hiding every post.
+	if filter.prune(filter_cfg, folder_set()) then
+		save_filter()
+	end
 	local iv = interval()
 	for _, f in feeds_list do
 		last_stamp = math.max(last_stamp, f.seen_until or 0)
@@ -481,6 +486,33 @@ local function find(id: string): (Feed?, number?)
 		end
 	end
 	return nil, nil
+end
+
+-- The feed other than `except` that already follows `u`, by URL or by id: ids are URL hashes, but a
+-- record written before retargets re-keyed them may carry an id that no longer matches its URL.
+local function url_taken(u: string, except: Feed?): Feed?
+	local id = feed.hash(u)
+	for _, f in feeds_list do
+		if f ~= except and (f.url == u or f.id == id) then
+			return f
+		end
+	end
+	return nil
+end
+
+-- Deletes feed `id`'s cached posts, from memory and from disk.
+local function drop_cache(id: string)
+	caches[id] = nil
+	local path = cache_path(id)
+	local ok, exists = pcall(tern.fs.exists, path)
+	if ok and exists then
+		local removed, err = pcall(function()
+			tern.fs.remove(path)
+		end)
+		if not removed then
+			tern.log.warn("tern-rss store: cannot remove", path, err)
+		end
+	end
 end
 
 -- Fetching ------------------------------------------------------------------------------------------
@@ -655,6 +687,7 @@ local pump: () -> ()
 local function fetch_feed(f: Feed)
 	local id = f.id
 	local host = url.host(f.url)
+	local sent = f.url
 	inflight[id] = true
 	inflight_n += 1
 	local prev = statuses[id]
@@ -664,8 +697,8 @@ local function fetch_feed(f: Feed)
 	local function finish(err: string?)
 		inflight[id] = nil
 		inflight_n -= 1
-		-- Removed (or removed and re-added) while in flight: drop the result.
-		if find(id) == f then
+		-- Removed, removed and re-added, or retargeted while in flight: drop the result.
+		if find(id) == f and f.url == sent then
 			local now = os.time()
 			if err then
 				statuses[id] = { state = "error", error = err, checked = now }
@@ -679,7 +712,8 @@ local function fetch_feed(f: Feed)
 	end
 
 	get(f.url, caches[id], function(r: FetchResult?)
-		if find(id) ~= f then
+		-- A retarget while the request was out leaves this response about a URL the feed no longer has.
+		if find(id) ~= f or f.url ~= sent then
 			finish(nil)
 			return
 		end
@@ -921,10 +955,6 @@ function store.restore_seen(prev: { [string]: number | false })
 		end
 	end
 	save_feeds()
-	-- A group whose last feed just left stops hiding posts in the filter.
-	if filter.prune(filter_cfg, folder_set()) then
-		save_filter()
-	end
 	notify()
 end
 
@@ -971,12 +1001,12 @@ function store.set_folder(id: string, name: string?): boolean
 	ensure_loaded()
 	local f = find(id)
 	if not f then
-		return
+		return false
 	end
 	local want = string.match(name or "", "^%s*(.-)%s*$") or ""
 	local g: string? = if want == "" then nil else fmt.clip(want, 60)
 	if f.folder == g then
-		return
+		return true
 	end
 	f.folder = g
 	save_feeds()
@@ -984,6 +1014,7 @@ function store.set_folder(id: string, name: string?): boolean
 		save_filter()
 	end
 	notify()
+	return true
 end
 
 -- The Latest tab's filter, shared by every RSS block in this host.
@@ -1003,7 +1034,7 @@ function store.toggle_favorite(id: string)
 	ensure_loaded()
 	local f = find(id)
 	if not f then
-		return false
+		return
 	end
 	f.favorite = not f.favorite
 	items_memo = nil
@@ -1014,24 +1045,17 @@ end
 function store.remove(id: string)
 	ensure_loaded()
 	local f, i = find(id)
-	return true
 	if not f or not i then
-		return true
+		return
 	end
 	table.remove(feeds_list, i)
-	caches[id] = nil
 	statuses[id] = nil
 	next_at[id] = nil
 	items_memo = nil
-	local path = cache_path(id)
-	local ok, exists = pcall(tern.fs.exists, path)
-	if ok and exists then
-		local removed, err = pcall(function()
-			tern.fs.remove(path)
-		end)
-		if not removed then
-			tern.log.warn("tern-rss store: cannot remove", path, err)
-		end
+	drop_cache(id)
+	-- A group whose last feed just left stops hiding posts in the filter.
+	if filter.prune(filter_cfg, folder_set()) then
+		save_filter()
 	end
 	save_feeds()
 	notify()
@@ -1105,59 +1129,95 @@ local function probe(candidates: { string }, done: (target: string?, r: FetchRes
 end
 
 -- Renames `id` to `title` and moves it to `url`. Empty strings mean "leave as it is", so a feed can
--- be renamed without refetching and retargeted without renaming. A new URL is probed like a feed the
--- user just added: `done` gets the error when it isn't a feed, and the feed keeps its old URL.
--- Returns false when there is no such feed or nothing to change.
-function store.rename(id: string, title: string, target: string, done: (string?) -> ()): boolean
+-- be renamed without refetching and retargeted without renaming; only a title that differs from the
+-- current one counts as the user's own. A new URL is normalized like an added one and probed: `done`
+-- gets the error when it isn't a feed or another feed already follows it, and the feed keeps its old
+-- URL. A retarget is a different feed, so on success its cached posts go and it takes the new URL's
+-- hash as its id (store.add finds duplicates by that hash); `done` gets that id. Returns false when
+-- there is no such feed or nothing to change.
+function store.rename(id: string, title: string, target: string, done: (err: string?, new_id: string?) -> ()): boolean
 	ensure_loaded()
 	local f = find(id)
 	if not f then
 		return false
 	end
+	-- The same clip the parser uses, so a hand-edited title is the same length a fetched one is.
 	local want = nonempty(title)
-	local u = nonempty(target)
-	if want == nil and (u == nil or u == f.url) then
+	want = if want then fmt.clip(want, 200) else nil
+	local to: string? = nil
+	local typed = nonempty(target)
+	if typed then
+		to = url.normalize(typed)
+		if to == nil then
+			done("That doesn't look like a web address.")
+			return true
+		end
+	end
+	local retitle = want ~= nil and want ~= f.title
+	local retarget = to ~= nil and to ~= f.url
+	if not retitle and not retarget then
 		return false
 	end
-	if want then
-		-- The same clip the parser uses, so a hand-edited title is the same length a fetched one is.
-		f.title = fmt.clip(want, 200)
-		f.title_set = true
+	if to ~= nil and retarget then
+		local taken = url_taken(to, f)
+		if taken then
+			done(`You already follow {taken.title}.`)
+			return true
+		end
 	end
-	items_memo = nil
-	save_feeds()
-	notify()
+	if retitle and want then
+		f.title = want
+		f.title_set = true
+		items_memo = nil
+		save_feeds()
+		notify()
+	end
 	-- The record on disk keeps the old URL until the probe passes: a saved bad URL would survive a
 	-- restart, and then every refresh of this feed would fail until the user edited it again.
-	if u == nil or u == f.url then
-		done(nil)
+	if to == nil or not retarget then
+		done(nil, id)
 		return true
 	end
-	-- A different URL is a different feed: show it fetching while the probe is out.
+	-- A different URL is a different feed: show it fetching while the probe is out. next_at stays, so
+	-- the poller doesn't fetch the old URL meanwhile and merge its posts after the switch.
+	local before = statuses[id]
 	statuses[id] = { state = "loading" }
-	next_at[id] = 0
 	notify()
-	probe({ u }, function(hit: string?, r: FetchResult?, parsed: feed.Parsed?)
+	local dest: string = to
+	probe({ dest }, function(hit: string?, r: FetchResult?, parsed: feed.Parsed?)
 		local again = find(id)
 		if again == nil then
 			return -- Removed while the probe was out.
 		end
-		if hit == nil or parsed == nil or r == nil then
-			statuses[id] = { state = "error", error = `{(url.host(u))} isn't serving an RSS or Atom feed.` }
+		local function refuse(message: string)
+			-- The feed itself is as healthy as it was; the message goes to the caller.
+			statuses[id] = before
 			notify()
-			done(`{url.host(u)} isn't serving an RSS or Atom feed.`)
+			done(message)
+		end
+		if hit == nil or parsed == nil or r == nil then
+			refuse(`{url.host(dest)} isn't serving an RSS or Atom feed.`)
 			return
 		end
-		again.url = u
-		local res = r :: FetchResult
+		local taken = url_taken(dest, again)
+		if taken then
+			refuse(`You already follow {taken.title}.`)
+			return
+		end
+		drop_cache(id)
+		local new_id = feed.hash(dest)
+		statuses[id] = nil
+		next_at[id] = nil
+		again.url = dest
+		again.id = new_id
 		items_memo = nil
-		apply(again, parsed, res)
-		-- The URL itself changed, so this write is not optional: apply() only reports the title.
+		apply(again, parsed, r)
+		-- The URL and id changed, so this write is not optional: apply() only reports the title.
 		save_feeds()
-		statuses[id] = { state = "ok", checked = os.time() }
-		next_at[id] = os.time() + interval()
+		statuses[new_id] = { state = "ok", checked = os.time() }
+		next_at[new_id] = os.time() + interval()
 		notify()
-		done(nil)
+		done(nil, new_id)
 	end)
 	return true
 end
@@ -1186,7 +1246,7 @@ function store.add(input: string, cb: (feed: Feed?, err: string?, why: AddFailur
 		reply(nil, "That doesn't look like a web address.", "invalid")
 		return
 	end
-	local existing = find(feed.hash(u))
+	local existing = url_taken(u)
 	if existing then
 		reply(nil, `You already follow {existing.title}.`, "duplicate")
 		return
@@ -1197,7 +1257,7 @@ function store.add(input: string, cb: (feed: Feed?, err: string?, why: AddFailur
 
 	local function follow(final: string, r: FetchResult, parsed: feed.Parsed)
 		local id = feed.hash(final)
-		local dup = find(id)
+		local dup = url_taken(final)
 		if dup then
 			reply(nil, `You already follow {dup.title}.`, "duplicate")
 			return
@@ -1321,7 +1381,7 @@ local function handle_answer(s: Search, n: number, answer: { [string]: any })
 		return
 	end
 	local normalized = url.normalize(feed_url)
-	local existing = if normalized then find(feed.hash(normalized)) else nil
+	local existing = if normalized then url_taken(normalized) else nil
 	if existing then
 		result(id, n, true, existing.title, nil)
 		toast("info", "You already follow " .. existing.title)
