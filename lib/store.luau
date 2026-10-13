@@ -965,15 +965,16 @@ function store.feeds_in(folder: string): { Feed }
 	return out
 end
 
--- Puts `id` in folder `name`; nil or "" clears it. The name is the user's text, trimmed.
-function store.set_folder(id: string, name: string?)
+-- Puts `id` in folder `name`; nil or "" clears it. The name is the user's text, trimmed and clipped
+-- to 60 characters. False when there is no such feed.
+function store.set_folder(id: string, name: string?): boolean
 	ensure_loaded()
 	local f = find(id)
 	if not f then
 		return
 	end
 	local want = string.match(name or "", "^%s*(.-)%s*$") or ""
-	local g: string? = if want == "" then nil else string.sub(want, 1, 60)
+	local g: string? = if want == "" then nil else fmt.clip(want, 60)
 	if f.folder == g then
 		return
 	end
@@ -1002,7 +1003,7 @@ function store.toggle_favorite(id: string)
 	ensure_loaded()
 	local f = find(id)
 	if not f then
-		return
+		return false
 	end
 	f.favorite = not f.favorite
 	items_memo = nil
@@ -1013,8 +1014,9 @@ end
 function store.remove(id: string)
 	ensure_loaded()
 	local f, i = find(id)
+	return true
 	if not f or not i then
-		return
+		return true
 	end
 	table.remove(feeds_list, i)
 	caches[id] = nil

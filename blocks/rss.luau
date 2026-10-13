@@ -246,6 +246,33 @@ local function selected_item(state: State, rows: { store.Item }): (store.Item?, 
 	return rows[i], i
 end
 
+-- One entry per row the Feeds list draws: a folder header (`name`) or a feed. Once the user groups
+-- anything the list is one header per folder, each above its own feeds, ungrouped last; a flat
+-- subscription list draws as it always did. Headers are not selectable, so selection stays on feed
+-- ids. Also returns the feeds alone in that same order and how many headers there are: j/k, the
+-- fallback selection and removal must all walk the order the screen shows, not subscription order.
+local function drawn_feeds(): ({ { name: string?, feed: store.Feed? } }, { store.Feed }, number)
+	local folders = store.folders()
+	local grouped = #folders > 1 or (folders[1] ~= nil and folders[1] ~= filter.UNGROUPED)
+	local drawn: { { name: string?, feed: store.Feed? } } = {}
+	local order: { store.Feed } = {}
+	if grouped then
+		for _, name in folders do
+			table.insert(drawn, { name = name, feed = nil })
+			for _, f in store.feeds_in(name) do
+				table.insert(drawn, { name = nil, feed = f })
+				table.insert(order, f)
+			end
+		end
+	else
+		for _, f in store.feeds() do
+			table.insert(drawn, { name = nil, feed = f })
+			table.insert(order, f)
+		end
+	end
+	return drawn, order, if grouped then #folders else 0
+end
+
 local function selected_feed(state: State, feeds: { store.Feed }): (store.Feed?, number)
 	for i, f in feeds do
 		if f.id == state.sel.feeds then
@@ -408,14 +435,14 @@ local function tally(latest: Latest): (number, { [string]: number }, number)
 	return fav, per, shown
 end
 
--- Feed ids a catch-up covers: every feed on Latest, starred ones on Favorites, the selected one on Feeds.
 -- Feed ids a catch-up covers: on Latest the feeds the filter's groups keep, starred ones on
 -- Favorites, the selected one on Feeds. Posts a rule hides are caught up with their feed.
 local function catch_up_scope(state: State): { string }
 	local ids: { string } = {}
 	local feeds = store.feeds()
 	if state.tab == "feeds" then
-		local f = selected_feed(state, feeds)
+		local _, order = drawn_feeds()
+		local f = selected_feed(state, order)
 		if f then
 			table.insert(ids, f.id)
 		end
@@ -595,8 +622,14 @@ local function submit_folder(state: State, cx: BlockCx, field: Field)
 	if target == nil then
 		return
 	end
-	store.set_folder(target, name)
-	cx:toast("success", if name == "" then "Left its group" else "Grouped under " .. name)
+	if not store.set_folder(target, name) then
+		cx:toast("info", "That feed is gone")
+		return
+	end
+	-- The stored name is trimmed and clipped, so the toast reads back what was kept.
+	local kept = store.feed(target)
+	local group = if kept then kept.folder else nil
+	cx:toast("success", if group == nil or group == "" then "Left its group" else "Grouped under " .. group)
 end
 
 -- The rule field appends to the end of the rule list; a line that doesn't parse stays in the field
@@ -737,7 +770,7 @@ local function field_key(state: State, f: Field, k: Key, cx: BlockCx): boolean
 	elseif k.name == "end" then
 		f.cursor = #text
 		return true
-	elseif k.name == "space" and (k.text == nil or k.text == "") then
+	elseif k.name == "space" and (k.text == nil or k.text == "") and not (k.ctrl or k.meta) then
 		-- A space key that carries no text still types a space, so a field never silently eats it.
 		f.text = string.sub(text, 1, cursor) .. " " .. string.sub(text, cursor + 1)
 		f.cursor = cursor + 1
@@ -891,7 +924,7 @@ local function remove_feed(state: State, id: string)
 		state.confirm = id
 		return
 	end
-	local feeds = store.feeds()
+	local _, feeds = drawn_feeds()
 	local next_id: string? = nil
 	for i, f in feeds do
 		if f.id == id then
@@ -1405,27 +1438,9 @@ local function feeds_view(state: State, cx: BlockCx, parts: { Node }, per: { [st
 		)
 	end
 
-	local feeds = store.feeds()
+	local drawn, feeds, headers = drawn_feeds()
 	local sel = selected_feed(state, feeds)
 	local rows: { Node } = {}
-	-- One header per folder, once the user groups anything, drawn directly above that folder's own
-	-- feeds (ungrouped last). A flat subscription list draws as it always did. Headers are not
-	-- selectable, so selection stays on feed ids.
-	local folders = store.folders()
-	local grouped = #folders > 1 or (folders[1] ~= nil and folders[1] ~= filter.UNGROUPED)
-	local drawn: { { name: string?, feed: store.Feed? } } = {}
-	if grouped then
-		for _, name in folders do
-			table.insert(drawn, { name = name, feed = nil })
-			for _, f in store.feeds_in(name) do
-				table.insert(drawn, { name = nil, feed = f })
-			end
-		end
-	else
-		for _, f in feeds do
-			table.insert(drawn, { name = nil, feed = f })
-		end
-	end
 	for _, entry in drawn do
 		local f = entry.feed
 		if f == nil and entry.name ~= nil then
@@ -1482,7 +1497,7 @@ local function feeds_view(state: State, cx: BlockCx, parts: { Node }, per: { [st
 			key = "feeds",
 			selected = if sel then "main.feeds." .. sel.id else nil,
 			-- A group header takes a row too, so the budget shrinks by the headers drawn.
-			max = { lines = rows_fitting(cx.rows - 12 - if grouped then #folders else 0, 4) },
+			max = { lines = rows_fitting(cx.rows - 12 - headers, 4) },
 		}, rows)
 	)
 
@@ -1711,7 +1726,7 @@ local function headlines_key(state: State, k: Key, cx: BlockCx): boolean
 end
 
 local function feeds_key(state: State, k: Key, cx: BlockCx): boolean
-	local feeds = store.feeds()
+	local _, feeds = drawn_feeds()
 	local feed, index = selected_feed(state, feeds)
 	local n = k.name
 	-- `d` arms the removal and `d` again confirms. A bare backspace used to delete the feed, which is
