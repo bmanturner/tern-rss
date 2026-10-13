@@ -52,7 +52,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `1` `2` `3`, `tab` / `shift+tab` | Switch tabs |
 | `j` `k`, arrows, `g` `G`, `page_up` `page_down` | Move |
 | `space` (`→` / `←` to show / hide) | Toggle the preview under the selected headline |
-| `enter` or `o` | Open the article beside the list (marks it read): in the native reader by default, which draws its text, headings, lists, quotes, code and images in place (page furniture such as navigation, sidebars, footers and forms is left out), or in Tern's browser. One pane reads every article; a page the reader can't read opens in the browser in its place |
+| `enter` or `o` | Open the article beside the list (marks it read): in the native reader by default, which draws its text, headings, lists, quotes, code and images in place (page furniture such as navigation, sidebars, footers and forms is left out), or in Tern's browser. One pane reads every article; a page the reader can't read (an error, too little text, or an encoding other than UTF-8 or Latin-1) opens in the browser in its place |
 | `b` | Switch where articles open: the native reader or Tern's browser (saved, shared by every RSS block) |
 | `m` | Mark one post read / unread |
 | `shift+r` | Mark the posts this tab shows read, or unread when they all already are |
@@ -65,7 +65,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `c` | Ask Carly to find a feed after one wasn't found; `esc` dismisses |
 | `f` (Latest) | Edit the filter: read state, groups, then ordered rules |
 | `t` (Feeds) | Set the selected feed's group (`t`, since `g` jumps to the top) |
-| `e` (Feeds) | Edit the selected feed: its title and its URL, on one line (`Title https://example.com/feed`, or `Title example.com/feed`). Leave either out to keep it; a title only counts as yours when you change it. A new URL must itself be a feed (no page discovery): it is fetched before it replaces the old one, is refused when you already follow it, and replaces the feed's posts. The field stays open while it is checked; a refusal shows the reason under the field and keeps what you typed, and a title typed with a refused URL is not saved either |
+| `e` (Feeds) | Edit the selected feed: its title and its URL, on one line (`Title https://example.com/feed`, or `Title example.com/feed`). Leave either out to keep it; a title only counts as yours when you change it. A new URL must itself be a feed (no page discovery): it is fetched before it replaces the old one, is refused when you already follow it, and replaces the feed's posts. The field stays open while it is checked; a refusal shows the reason under the field and keeps what you typed, and a title typed with a refused URL is not saved either. If the feed changed while the field was open (another block gave it a new URL), the field asks you to open it again |
 
 ### Counts and catch-up
 
@@ -188,7 +188,7 @@ The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filte
 {"version":1,"read":"unread","groups":{"tech":true},"excluded":{},"rules":["#Rust Weekly keep /./","/sponsor/i"]}
 ```
 
-`read` is `all`, `unread` or `read`, `groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter starts over from its defaults (unread only, no groups, no rules). A rule line that doesn't parse stays where it is and is written back untouched: the panel shows it with a ⚠ and the reason, it does nothing until you fix it by hand, and `d` deletes it. Groups no feed carries any more are dropped from the file when it loads, unless `feeds.json` itself failed to load (then nothing is dropped). The filter is shared by every RSS block in this host, like the feed list.
+`read` is `all`, `unread` or `read`, `groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter starts over from its defaults (unread only, no groups, no rules). A rule line that doesn't parse stays where it is and is written back untouched: the panel shows it with a ⚠ and the reason, it does nothing until you fix it by hand, and `d` deletes it. Groups no feed carries any more are dropped from the file when it loads. When `feeds.json` failed to load (it is kept as `feeds.json.bad`), the saved group checks and exclusions are set aside instead: they don't apply, so feeds you add meanwhile stay visible, and they stay in the file, so restoring `feeds.json.bad` brings them back. Deleting `feeds.json.bad` ends that at the next start. The filter is shared by every RSS block in this host, like the feed list.
 
 ## Privacy
 
@@ -203,7 +203,7 @@ The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filte
 
 - **Network:** each feed URL with `tern.fetch`, every refresh interval while an RSS block is open. Requests are conditional (`If-None-Match` / `If-Modified-Since`), at most 4 at a time, with a 20 s timeout; bodies over 4 MB are rejected. Adding a site also fetches its feed candidates, at most 4 at a time with a 10 s timeout each. The reader fetches the article page (it reads the first 1.5 MB) and up to 12 of its `http(s)` images with `tern.fetch`'s defaults (30 s); an image is shown only when it is `image/*` and at most 4 MiB.
 - **Programs:** none.
-- **Writes:** in the plugin data directory, `rss/feeds.json` (each feed and its group), `rss/read.json`, `rss/filters.json`, `rss/cache/<feed>.json`, `reader-<rss pane>.json` (the last article clicked in that RSS pane, which the reader beside it follows; a few bytes, overwritten by the next click) and, only after you ask Carly, `rss/carly/<id>.{request,answer,asked,result}.json`; `kv.json` when config is set, when `b` is pressed, and for the `articles` key (which pane beside each RSS pane is its article pane). Nothing in the package folder.
+- **Writes:** in the plugin data directory, `rss/feeds.json` (each feed and its group), `rss/read.json`, `rss/filters.json`, `rss/cache/<feed>.json`, `reader-<rss pane>.json` (the last article clicked in that RSS pane, its click number and time, which the reader beside it follows; a few bytes, overwritten by the next click) and, only after you ask Carly, `rss/carly/<id>.{request,answer,asked,result}.json`; `kv.json` when config is set, when `b` is pressed, and for the `articles` key (which pane beside each RSS pane is its article pane). Nothing in the package folder.
 - **Reads:** `plugin.toml`, the `blocks/` listing, and the files above.
 - **Logs:** warn lines prefixed `tern-rss`.
 
