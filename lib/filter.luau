@@ -6,8 +6,12 @@
 --
 --   /pattern/            hide matching posts, everywhere
 --   @group /pattern/i    hide them in one group, case-insensitively
---   #Feed Name /pattern/ hide them in one feed
+--   #Feed Name /pattern/ hide them in one feed, named by its title, id, host or URL
 --   @group keep /pat/    keep matching posts in that group (an exception to a drop)
+--   @"News / Tech" /x/   a name with a slash, or ending in the word keep or drop, goes in quotes
+--
+-- The pattern opens at the first slash that starts a word, so `@News/Tech /x/` is the group
+-- `News/Tech`; inside quotes `\"` and `\\` are escapes.
 --
 -- The pattern is a real regular expression with flags (`i` caseless, `m` multiline, `s` dotall,
 -- `x` extended), because "Luau patterns" are a dialect nobody has learned and this file's readers
@@ -15,7 +19,8 @@
 -- luau-regexp). Patterns compile once, when the rule is parsed, and the engine stops any one search at a step limit.
 --
 -- Rules are read in order and the FIRST that matches decides the post: `drop` hides it, `keep`
--- shows it. With no rule matching, the group gate decides. A pattern is matched against the post's
+-- shows it. With no rule matching, the group gate decides; an excluded group is the one thing no
+-- rule overrides. A pattern is matched against the post's
 -- text as it is; use the `i` flag where case matters.
 --
 -- Pure in spirit (only lib/regexp, no tern API), so either half can load it and the store can hold
@@ -30,8 +35,9 @@ export type Scope = { kind: "all" } | { kind: "group", name: string } | { kind: 
 -- were.
 export type Hit = { title: string, preview: string?, hit: boolean }
 -- A rule: the scope, the action, the pattern, its flags, and the compiled pattern. `raw` is the line
--- as typed, so the panel and filters.json show it back. `slow` is set when a real post ran the
--- pattern out of steps (it is skipped from then on); `memo` is the posts it has judged.
+-- as typed, so the panel and filters.json show it back. `broken` is why a stored line does not parse
+-- (the rule is kept and written back, never applied); `slow` is set when a real post ran the pattern
+-- out of steps (it is skipped from then on); `memo` is the posts it has judged.
 export type Rule = {
 	scope: Scope,
 	drop: boolean,
@@ -39,6 +45,7 @@ export type Rule = {
 	flags: string,
 	rx: any,
 	raw: string,
+	broken: string?,
 	slow: boolean,
 	memo: { [string]: Hit },
 	memo_n: number,
@@ -98,28 +105,80 @@ local function trim(s: string): string
 	return string.sub(s, first, last)
 end
 
--- Whether `pat` carries a `|` at its top level, outside any group or class and not escaped. Only
--- such a pattern needs the group the engine requires.
-local function has_top_alternation(pat: string): boolean
+-- The index just past the escape at `i` (a backslash): its pair, or all of a `\Q…\E` quote.
+local function skip_escape(pat: string, i: number): number
+	if string.sub(pat, i + 1, i + 1) == "Q" then
+		local close = string.find(pat, "\\E", i + 2, true)
+		return if close then close + 2 else #pat + 1
+	end
+	return i + 2
+end
+
+-- The index just past the class that opens at `i`. A `]` first in the class, an escaped one and one
+-- closing a `[:posix:]` name do not end it.
+local function skip_class(pat: string, i: number): number
+	local j = i + 1
+	if string.sub(pat, j, j) == "^" then
+		j += 1
+	end
+	if string.sub(pat, j, j) == "]" then
+		j += 1
+	end
+	while j <= #pat do
+		local c = string.sub(pat, j, j)
+		if c == "\\" then
+			j = skip_escape(pat, j)
+		elseif c == "[" and string.sub(pat, j + 1, j + 1) == ":" then
+			local close = string.find(pat, ":]", j + 2, true)
+			j = if close then close + 2 else j + 1
+		elseif c == "]" then
+			return j + 1
+		else
+			j += 1
+		end
+	end
+	return #pat + 1
+end
+
+-- What the pattern carries that matters before it compiles: a `|` at its top level (outside any
+-- group, class, comment or `\Q…\E` quote, and not escaped), and a `\b` or `\B` outside a quote. In
+-- `x` mode a `#` comment runs to the end of the line and holds neither.
+local function scan(pat: string, extended: boolean): (boolean, boolean)
 	local depth, i = 0, 1
+	local alternation, boundary = false, false
 	while i <= #pat do
 		local c = string.sub(pat, i, i)
 		if c == "\\" then
-			i += 1
+			local nxt = string.sub(pat, i + 1, i + 1)
+			if nxt == "b" or nxt == "B" then
+				boundary = true
+			end
+			i = skip_escape(pat, i)
 		elseif c == "(" then
-			-- A group, a flag group or a look-around: each closes with a `)`.
-			depth += 1
+			if string.sub(pat, i, i + 2) == "(?#" then
+				local close = string.find(pat, ")", i + 3, true)
+				i = if close then close + 1 else #pat + 1
+			else
+				-- A group, a flag group or a look-around: each closes with a `)`.
+				depth += 1
+				i += 1
+			end
 		elseif c == ")" then
 			depth -= 1
+			i += 1
 		elseif c == "[" then
-			local close = string.find(pat, "]", i + 1, true)
-			i = if close then close else #pat
-		elseif c == "|" and depth == 0 then
-			return true
+			i = skip_class(pat, i)
+		elseif c == "#" and extended then
+			local newline = string.find(pat, "\n", i + 1, true)
+			i = if newline then newline + 1 else #pat + 1
+		else
+			if c == "|" and depth == 0 then
+				alternation = true
+			end
+			i += 1
 		end
-		i += 1
 	end
-	return false
+	return alternation, boundary
 end
 
 -- Text a pattern has to survive when the rule is added: empty, short, runs of one letter, words,
@@ -144,7 +203,8 @@ local SAMPLES: { string } = {
 --   * Top-level alternation only ever matches at the first position, so `/ads|广告/` misses a post
 --     whose title starts with something else. Wrapping the pattern in a group fixes it, and only a
 --     pattern that really carries a top-level `|` is wrapped: a group around a pattern that matches
---     nothing on its own, such as a lone lookahead, would change what the pattern matches.
+--     nothing on its own, such as a lone lookahead, would change what the pattern matches. In `x`
+--     mode the group closes on a new line, so a trailing `# comment` cannot swallow its `)`.
 --   * `\b` and `\B` raise at match time rather than compile time. They are refused here, so the
 --     problem shows up under the field instead of in the middle of a list.
 --   * A quantified group that can match empty never finishes, and nested quantifiers can backtrack
@@ -157,10 +217,12 @@ function filter.compile(pat: string, flags: string): (any?, string?)
 			return nil, `Unknown flag "{c}"; the flags are i, m, s and x`
 		end
 	end
-	if string.find(pat, "\\[bB]") then
+	local alternation, boundary = scan(pat, string.find(flags, "x", 1, true) ~= nil)
+	if boundary then
 		return nil, "The engine cannot run \\b or \\B; use a capture like (^| )word, or stop at spaces"
 	end
-	local source = if has_top_alternation(pat) then `(?:{pat})` else pat
+	local close = if string.find(flags, "x", 1, true) then "\n)" else ")"
+	local source = if alternation then `(?:{pat}{close}` else pat
 	local ok, rx = pcall(function()
 		return regexp.new(source, flags)
 	end)
@@ -185,6 +247,79 @@ function filter.valid(pat: string, flags: string): boolean
 	return filter.compile(pat, flags) ~= nil
 end
 
+local function is_action(word: string): boolean
+	local w = string.lower(word)
+	return w == "keep" or w == "drop"
+end
+
+local function skip_space(s: string, i: number): number
+	return string.find(s, "%S", i) or #s + 1
+end
+
+-- Whether the next non-space character from `i` is the pattern's opening slash.
+local function slash_follows(s: string, i: number): boolean
+	return string.sub(s, skip_space(s, i), skip_space(s, i)) == "/"
+end
+
+-- A bare scope name takes words up to the action word or the opening slash, so `#Rust Weekly keep /x/`
+-- names a feed of two words and `@News/Tech /x/` a group with a slash in it. Returns the name and
+-- the index where it ended.
+local function read_bare_name(s: string, from: number): (string, number)
+	local start = skip_space(s, from)
+	local pos = start
+	while pos <= #s do
+		local word = string.match(s, "^%S+", pos) :: string
+		if string.sub(word, 1, 1) == "/" then
+			break
+		end
+		local lead = string.match(string.lower(word), "^(%a+)/")
+		if (is_action(word) and slash_follows(s, pos + #word)) or (lead ~= nil and is_action(lead)) then
+			break
+		end
+		pos = skip_space(s, pos + #word)
+	end
+	return trim(string.sub(s, start, pos - 1)), pos
+end
+
+-- A quoted name, from the character after the opening quote: `\"` and `\\` are escapes. Returns the
+-- name and the index past the closing quote, or nil when it never closes.
+local function read_quoted(s: string, from: number): (string?, number)
+	local out: { string } = {}
+	local i = from
+	while i <= #s do
+		local c = string.sub(s, i, i)
+		if c == "\\" and (string.sub(s, i + 1, i + 1) == '"' or string.sub(s, i + 1, i + 1) == "\\") then
+			table.insert(out, string.sub(s, i + 1, i + 1))
+			i += 2
+		elseif c == '"' then
+			return table.concat(out), i + 1
+		else
+			table.insert(out, c)
+			i += 1
+		end
+	end
+	return nil, i
+end
+
+-- A name is written bare unless that would be read back differently: a slash, a quote, or an action
+-- word in it.
+local function quote_name(name: string): string
+	local plain = string.find(name, '[/"]') == nil
+	for word in string.gmatch(name, "%S+") do
+		if is_action(word) then
+			plain = false
+		end
+	end
+	if plain then
+		return name
+	end
+	return '"' .. string.gsub(string.gsub(name, "\\", "\\\\"), '"', '\\"') .. '"'
+end
+
+local function new_rule(scope: Scope, drop: boolean, pat: string, flags: string, rx: any, raw: string): Rule
+	return { scope = scope, drop = drop, pat = pat, flags = flags, rx = rx, raw = raw, broken = nil, slow = false, memo = {}, memo_n = 0 }
+end
+
 -- One rule line, as documented at the top of this file. Returns the rule, or nil and a reason to
 -- show under the field.
 function filter.parse(line: string): (Rule?, string?)
@@ -192,12 +327,43 @@ function filter.parse(line: string): (Rule?, string?)
 	if s == "" then
 		return nil, "Type a rule: /pattern/ or @group drop /pattern/i"
 	end
-	-- The pattern runs from the first slash to the last one, so a slash inside it is fine, and the
-	-- flags are what follows the last one.
-	local open = string.find(s, "/", 1, true)
-	if open == nil then
-		return nil, "A rule needs a /pattern/; the flags go after the closing slash"
+	-- Before the pattern: an optional scope, then an optional action word.
+	local scope: Scope = { kind = "all" }
+	local i = 1
+	local mark = string.sub(s, 1, 1)
+	if mark == "@" or mark == "#" then
+		local name: string?, after: number
+		if string.sub(s, 2, 2) == '"' then
+			name, after = read_quoted(s, 3)
+			if name == nil then
+				return nil, "That name has no closing quote"
+			end
+		else
+			name, after = read_bare_name(s, 2)
+		end
+		if name == "" then
+			return nil, `A scope needs a name: @group or #feed`
+		end
+		scope = if mark == "@" then { kind = "group", name = name } else { kind = "feed", key = name }
+		i = after
 	end
+	local action = "drop"
+	i = skip_space(s, i)
+	local word = string.match(s, "^%a+", i)
+	if word ~= nil and is_action(word) and slash_follows(s, i + #word) then
+		action = string.lower(word)
+		i = skip_space(s, i + #word)
+	end
+	if string.sub(s, i, i) ~= "/" then
+		local slash = string.find(s, "/", i, true)
+		if slash == nil then
+			return nil, "A rule needs a /pattern/; the flags go after the closing slash"
+		end
+		return nil, `Don't know "{trim(string.sub(s, i, slash - 1))}"; a scope is @group or #feed, or leave it out for every feed`
+	end
+	local open = i
+	-- The pattern runs from the opening slash to the last one, so a slash inside it is fine, and the
+	-- flags are what follows the last one.
 	local close = #s
 	while close > open and string.sub(s, close, close) ~= "/" do
 		close -= 1
@@ -210,71 +376,30 @@ function filter.parse(line: string): (Rule?, string?)
 	if pat == "" then
 		return nil, "That pattern is empty"
 	end
-	-- Before the pattern: an optional action word, then an optional scope.
-	local head = trim(string.sub(s, 1, open - 1))
-	local action = "drop"
-	local lower = string.lower(head)
-	-- The bare word and the trailing word are separate cases: stripping " keep" off the four-letter
-	-- "keep" would take a negative count and leave the word in place.
-	if lower == "keep" then
-		action = "keep"
-		head = ""
-	elseif lower == "drop" then
-		head = ""
-	elseif string.sub(lower, -5) == " keep" then
-		action = "keep"
-		head = trim(string.sub(head, 1, #head - 5))
-	elseif string.sub(lower, -5) == " drop" then
-		head = trim(string.sub(head, 1, #head - 5))
-	end
-	local scope: Scope = { kind = "all" }
-	local mark = string.sub(head, 1, 1)
-	if mark == "@" or mark == "#" then
-		local name = trim(string.sub(head, 2))
-		if name == "" then
-			return nil, `A scope needs a name: @group or #feed`
-		end
-		scope = if mark == "@" then { kind = "group", name = name } else { kind = "feed", key = name }
-	elseif head ~= "" then
-		return nil, `Don't know "{head}"; a scope is @group or #feed, or leave it out for every feed`
-	end
 	local rx, err = filter.compile(pat, flags)
 	if rx == nil then
 		return nil, err
 	end
-	return {
-		scope = scope,
-		drop = action == "drop",
-		pat = pat,
-		flags = flags,
-		rx = rx,
-		raw = s,
-		slow = false,
-		memo = {},
-		memo_n = 0,
-	}
+	return new_rule(scope, action == "drop", pat, flags, rx, s)
+end
+
+-- A stored line that no longer parses, held in its place so a save writes it back untouched. It is
+-- never applied; the panel shows it with `reason` and `d` deletes it.
+function filter.broken(line: string, reason: string): Rule
+	local r = new_rule({ kind = "all" }, true, "", "", nil, line)
+	r.broken = reason
+	return r
 end
 
 -- The scope written back as a line prefix: `@group`, `#feed`, or "" for every feed.
 function filter.scope_text(scope: Scope): string
 	if scope.kind == "group" then
-		return "@" .. scope.name
+		return "@" .. quote_name(scope.name)
 	end
 	if scope.kind == "feed" then
-		return "#" .. scope.key
+		return "#" .. quote_name(scope.key)
 	end
 	return ""
-end
-
--- The rule written back as one line.
-function filter.format(r: Rule): string
-	local pat = string.gsub(r.pat, "/", "\\/")
-	local line = `/{pat}/{r.flags}`
-	local scope = filter.scope_text(r.scope)
-	if scope ~= "" then
-		line = scope .. " " .. line
-	end
-	return if r.drop then line else `keep {line}`
 end
 
 function filter.group(f: { folder: string? }?): string
@@ -294,12 +419,11 @@ local function in_scope(scope: Scope, f: { id: string, title: string, url: strin
 		return filter.group(f) == scope.name
 	end
 	local want = string.lower(scope.key)
-	if want == string.lower(f.id) or want == string.lower(f.title) then
+	if want == string.lower(f.id) or want == string.lower(f.title) or want == string.lower(f.url) then
 		return true
 	end
-	local host = f.url
-	local m = string.match(host, "^%a[%w+.-]*://([^/?#]+)")
-	return want == string.lower(m or host)
+	local m = string.match(f.url, "^%a[%w+.-]*://([^/?#]+)")
+	return want == string.lower(m or f.url)
 end
 
 -- The text a rule sees: the title and the preview the feed gave.
@@ -380,7 +504,9 @@ end
 
 -- Whether a post is shown: true or false, or nil when `filter.budget` ran out before the rules could
 -- say. `feed` is its feed, when the store still knows it, and `read` its read state. The read gate is
--- absolute: it decides before any rule does, so "Unread" means unread.
+-- absolute: it decides before any rule does, so "Unread" means unread. An excluded group comes next,
+-- because it always loses, whatever a `keep` rule says; a group that is merely not checked is a
+-- default a `keep` rule may override.
 function filter.visible(
 	cfg: Config,
 	item: { key: string, title: string, preview: string? },
@@ -392,8 +518,12 @@ function filter.visible(
 	elseif cfg.read == "read" and not read then
 		return false
 	end
+	local group = filter.group(feed)
+	if cfg.excluded[group] then
+		return false
+	end
 	for _, r in cfg.rules do
-		if not r.slow and in_scope(r.scope, feed) then
+		if r.broken == nil and not r.slow and in_scope(r.scope, feed) then
 			local hit = matches(r, item)
 			if hit == nil then
 				return nil
@@ -402,7 +532,7 @@ function filter.visible(
 			end
 		end
 	end
-	return filter.group_allows(cfg, filter.group(feed))
+	return next(cfg.groups) == nil or cfg.groups[group] == true
 end
 
 -- Whether the filter changes anything.
@@ -429,7 +559,8 @@ function filter.prune(cfg: Config, folders: { [string]: boolean }): boolean
 	return changed
 end
 
--- The stored form: rule lines, so the file stays readable and hand-editable.
+-- The stored form: rule lines, so the file stays readable and hand-editable. A broken line is
+-- written back as it was found.
 function filter.encode(cfg: Config): { [string]: any }
 	local rules: { string } = {}
 	for _, r in cfg.rules do
@@ -438,7 +569,8 @@ function filter.encode(cfg: Config): { [string]: any }
 	return { version = 1, read = cfg.read, groups = cfg.groups, excluded = cfg.excluded, rules = rules }
 end
 
--- The config in `v`, and how many stored rule lines no longer parse.
+-- The config in `v`, and how many stored rule lines no longer parse (they stay in the list as
+-- broken rules, in place).
 function filter.decode(v: any): (Config, number)
 	local cfg = filter.empty()
 	if type(v) ~= "table" then
@@ -466,11 +598,12 @@ function filter.decode(v: any): (Config, number)
 	if type(v.rules) == "table" then
 		for _, line in ipairs(v.rules) do
 			if type(line) == "string" then
-				local r = filter.parse(line)
+				local r, reason = filter.parse(line)
 				if r then
 					table.insert(cfg.rules, r)
 				else
 					bad += 1
+					table.insert(cfg.rules, filter.broken(line, reason or "Does not parse"))
 				end
 			end
 		end

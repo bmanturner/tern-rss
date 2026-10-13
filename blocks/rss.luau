@@ -1280,7 +1280,20 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 		else
 			local index = row.index :: number
 			local rule = cfg.rules[index]
-			if rule then
+			if rule and rule.broken then
+				-- Kept in its place and written back as it was; it does nothing until fixed or deleted.
+				table.insert(keys, "r" .. index)
+				table.insert(
+					children,
+					ui.node("item", {
+						key = "r" .. index,
+						label = { span(tostring(index) .. " ", "num"), span("⚠ " .. rule.raw, "warning") },
+						detail = "not applied: " .. rule.broken,
+						value = { span("K/J · d", "muted") },
+					})
+				)
+			elseif rule then
+				local where = if rule.scope.kind == "all" then "every feed" else filter.scope_text(rule.scope)
 				table.insert(keys, "r" .. index)
 				table.insert(
 					children,
@@ -1291,7 +1304,7 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: La
 							span(if rule.drop then "" else "keep ", if rule.drop then "muted" else "accent"),
 							span(`/{rule.pat}/{rule.flags}`, if rule.drop then "error" else "accent"),
 						},
-						detail = if rule.scope.kind == "all" then "every feed" else filter.scope_text(rule.scope),
+						detail = if rule.slow then where .. " · skipped: too slow on a post" else where,
 						value = { span("K/J · d", "muted") },
 					})
 				)

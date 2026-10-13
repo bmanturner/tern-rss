@@ -374,7 +374,7 @@ local function load_filter()
 	local cfg, bad = filter.decode(data)
 	filter_cfg = cfg
 	if bad > 0 then
-		tern.log.warn(`tern-rss store: {bad} filter rule(s) in filters.json didn't parse; dropped`)
+		tern.log.warn(`tern-rss store: {bad} filter rule(s) in filters.json don't parse; kept, not applied`)
 	end
 end
 
