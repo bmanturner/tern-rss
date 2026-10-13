@@ -2,7 +2,7 @@
 -- The `rss` block (host half): a river of headlines under three tabs (Latest, ★ Favorites, Feeds).
 -- Feeds, read state, caches and polling live in lib/store, shared by every RSS block; this file is the
 -- view, the keys and the clicks. Articles open through the window's `tern-rss://read/<pane>` route,
--- which docks one reader browser beside the block and reuses it.
+-- which docks one article pane (the native reader, or Tern's browser) beside the block and reuses it.
 
 local store = require("../lib/store")
 local url = require("../lib/url")
@@ -791,10 +791,10 @@ local function follow_starter(state: State, cx: BlockCx, i: number)
 	end)
 end
 
--- Opens `link` for reading. The native reader block (blocks/reader.luau) is the default: it fetches
--- the page itself and draws its text and images, so Tern's browser stays for what the extractor
--- cannot read. The reader keeps its own state per instance, and the window reuses one instance per
--- RSS pane, so a second article lands in the same reading pane.
+-- Opens `link` for reading through the window's route: the native reader block (blocks/reader.luau)
+-- fetches the page itself and draws its text and images, and hands the page to Tern's browser when
+-- it can't read it. The window keeps one article pane per RSS pane, so a second article lands in
+-- the same reading pane.
 local function open_article(cx: BlockCx, link: string)
 	cx:open("tern-rss://read/" .. cx.pane .. "?url=" .. url.encode(link))
 end

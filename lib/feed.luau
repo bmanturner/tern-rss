@@ -179,9 +179,11 @@ local BREAKS: { { string } } = {
 	{ "<[Ll][Ii]%s[^>]*>", "• " },
 }
 
-local function html_to_text(s: string): string
-	if #s > PREVIEW_SOURCE_MAX then
-		s = cut(s, PREVIEW_SOURCE_MAX)
+-- `max` raises the source cap above the preview's, for callers that measure a whole page.
+local function html_to_text(s: string, max: number?): string
+	local limit = max or PREVIEW_SOURCE_MAX
+	if #s > limit then
+		s = cut(s, limit)
 		s = string.gsub(s, "<[^>]*$", "") -- a tag cut in half
 	end
 	s = string.gsub(s, "<[Ss][Cc][Rr][Ii][Pp][Tt].-</[Ss][Cc][Rr][Ii][Pp][Tt]%s*>", "")
@@ -987,24 +989,51 @@ local ARTICLE_TEXT_MAX = 120_000
 -- At most this many images ship with one article.
 local ARTICLE_IMAGES_MAX = 12
 
--- The container whose direct paragraph text is longest, named by tag: the reader reads that one.
+-- The container the reader reads, named by tag: the semantic one (`article`, `main`, …) with the
+-- longest text, and `body` only when none has a readable amount. Body always holds at least as
+-- much text as anything inside it, so measured against the rest it would win on every page with a
+-- nav bar or a footer. Tags are found in a lowercased copy (same byte offsets) so `<ARTICLE>`
+-- counts, and every candidate is measured over the whole page, not the preview's first 16 KB.
 local function article_container(html: string): (string, string, string)
+	local lower = string.lower(html)
+	local function measure(kind: string): (string?, string?)
+		local open = string.find(lower, "<" .. kind .. "[%s>/]")
+		if open == nil then
+			return nil, nil
+		end
+		local gt = string.find(html, ">", open, true) or open
+		local close = string.find(lower, "</" .. kind .. ">", gt, true)
+		local inner = string.sub(html, gt + 1, if close then close - 1 else #html)
+		return inner, html_to_text(inner, ARTICLE_SOURCE_MAX)
+	end
 	local best_kind, best_src, best_text = "body", html, ""
-	for _, kind in { "article", "main", "content", "post", "body" } do
-		local open_pat = `<` .. kind .. `[%s>][^>]*>`
-		local open = string.find(html, open_pat)
-		if open then
-			local gt = string.find(html, ">", open, true) or open
-			local close_pat = `</` .. kind:lower() .. `>`
-			local close = string.find(html:lower(), close_pat, gt, true)
-			local inner = string.sub(html, gt + 1, if close then close - 1 else #html)
-			local text = html_to_text(inner)
-			if #text > #best_text and #text > 400 then
-				best_kind, best_src, best_text = kind, inner, text
-			end
+	for _, kind in { "article", "main", "content", "post" } do
+		local inner, text = measure(kind)
+		if inner and text and #text > #best_text and #text > 400 then
+			best_kind, best_src, best_text = kind, inner, text
+		end
+	end
+	if best_text == "" then
+		local inner, text = measure("body")
+		if inner and text and #text > 400 then
+			best_src, best_text = inner, text
 		end
 	end
 	return best_kind, best_src, best_text
+end
+
+-- `s` as literal Markdown text: page prose is data, not markup. Without this "$5 or $10" typesets
+-- as math and a printed `[x](tern-rss://read/…)` becomes a clickable route link. Backslash escapes
+-- cover the metacharacters ui.md's dialect reads; the structure this file adds (`#`, `- `) is
+-- written after escaping, so it stays live. Only `[` is escaped, never `]`: the dialect reads
+-- `\[…\]` as display math, so an escaped pair would typeset the text between.
+local function md_escape(s: string): string
+	s = string.gsub(s, "[\\`*_%[<>#|~$]", "\\%0")
+	-- A decoded "&amp;lt;" must not read as an entity again.
+	s = string.gsub(s, "&(#?%w+;)", "\\&%1")
+	-- Bare URLs autolink; this plugin's own route scheme must not be printable as a link.
+	s = string.gsub(s, "([Tt][Ee][Rr][Nn]%-[Rr][Ss][Ss]:)//", "%1\\//")
+	return s
 end
 
 -- Tag names that break a text run, and what they leave behind. `<br>` and `<li>` key their opening
@@ -1014,6 +1043,8 @@ local BREAKS_HTML: { [string]: string } = {
 	["</p"] = "\n\n",
 	["</div"] = "\n",
 	["</li"] = "\n",
+	["</ul"] = "\n\n",
+	["</ol"] = "\n\n",
 	["</h1"] = "\n\n",
 	["</h2"] = "\n\n",
 	["</h3"] = "\n\n",
@@ -1036,55 +1067,72 @@ function feed.article(body: string, base: string): Article
 	if inner == "" then
 		return { blocks = {}, text = "" }
 	end
+	-- Lowercased once: tag names are matched here, and a copy per <script> was quadratic.
+	local lower = string.lower(inner)
 	local blocks: { ArticleBlock } = {}
 	local buf: { string } = {}
 	local images = 0
+	-- Markdown bytes flushed so far; the walk stops once the article is past the cap.
+	local total = 0
 
 	local function flush()
-		local md = tidy(decode_entities(table.concat(buf)))
+		local md = tidy(table.concat(buf))
 		buf = {}
 		if md ~= "" then
+			total += #md
 			table.insert(blocks, { kind = "md", text = md })
 		end
 	end
 
+	local function add_text(s: string)
+		table.insert(buf, md_escape(decode_entities(s)))
+	end
+
 	local pos = 1
-	while true do
+	while total <= ARTICLE_TEXT_MAX do
 		local lt = string.find(inner, "<", pos, true)
 		if lt == nil then
-			table.insert(buf, string.sub(inner, pos))
+			add_text(string.sub(inner, pos))
 			break
 		end
 		if lt > pos then
-			table.insert(buf, string.sub(inner, pos, lt - 1))
+			add_text(string.sub(inner, pos, lt - 1))
 		end
 		local gt = string.find(inner, ">", lt, true)
 		if gt == nil then -- a half tag at the source cap: the rest is text
-			table.insert(buf, string.sub(inner, lt))
+			add_text(string.sub(inner, lt))
 			break
 		end
 		pos = gt + 1
 		local raw = string.sub(inner, lt + 1, gt - 1)
-		-- Both captures matter: the slash (a closing tag) and the name. Taking one value here was a
-		-- bug -- `name` held only the slash, so no tag was ever recognized.
-		local slash, bare = string.match(string.lower(raw), "^%s*(/?)%s*([%a%-]+)")
+		-- Both captures matter: the slash (a closing tag) and the name. The name takes digits too:
+		-- `h1`-`h6` never matched as letters only, so no heading was ever drawn as one.
+		local slash, bare = string.match(string.lower(raw), "^%s*(/?)%s*([%w%-]+)")
 		if bare == nil then
 			continue
 		end
 		local closing = slash == "/"
 		if not closing and (bare == "script" or bare == "style") then
-			local close = string.find(inner:lower(), "</" .. bare, gt, true)
-			pos = if close then select(2, string.find(inner, ">", close, true)) + 1 else gt + 1
+			-- Skip to the end of the closing tag; a cut that lands inside it (or no closing tag at
+			-- all) ends the walk or resumes after the opening tag, never past the source.
+			local close = string.find(lower, "</" .. bare, gt, true)
+			if close then
+				local close_gt = string.find(inner, ">", close, true)
+				pos = if close_gt then close_gt + 1 else #inner + 1
+			end
 		elseif bare == "img" and not closing then
 			images += 1
 			if images <= ARTICLE_IMAGES_MAX then
 				local attrs = decode_attrs("<" .. raw .. ">", true)
-				local src = attrs.src
-				if src and src ~= "" and string.sub(src, 1, 5) ~= "data:" then
+				local src = trim(attrs.src or "")
+				-- Only absolute http(s) without whitespace is fetchable: `javascript:`, `data:` and
+				-- friends would each raise in tern.fetch.
+				local abs = if src ~= "" then url.resolve(base, src) else ""
+				if string.find(abs, "^[hH][tT][tT][pP][sS]?://[^%s/?#]") and not string.find(abs, "%s") then
 					flush()
 					table.insert(blocks, {
 						kind = "img",
-						src = url.resolve(base, src),
+						src = abs,
 						alt = collapse(attrs.alt or ""),
 						w = tonumber(attrs.width),
 						h = tonumber(attrs.height),
@@ -1096,7 +1144,9 @@ function feed.article(body: string, base: string): Article
 			local right = BREAKS_HTML["</" .. bare]
 			if bare == "li" then
 				-- A list item is Markdown's "- ", on its own line, so ui.md draws a real list.
-				table.insert(buf, if closing then "\n" else "\n- ")
+				if not closing then
+					table.insert(buf, "\n- ")
+				end
 			elseif not closing and left then
 				table.insert(buf, left)
 			elseif closing and right then
@@ -1110,15 +1160,31 @@ function feed.article(body: string, base: string): Article
 	end
 	flush()
 
+	-- The cap applies to what ships, blocks and text alike: cut the block that crosses it and drop
+	-- the rest.
 	local text_parts: { string } = {}
-	for _, b in blocks do
-		table.insert(text_parts, if b.kind == "md" then (b.text :: string) else (b.alt or "image"))
+	local used = 0
+	for i, b in blocks do
+		local part = if b.kind == "md" then (b.text :: string) else (b.alt or "image")
+		if used + #part > ARTICLE_TEXT_MAX then
+			if b.kind == "md" then
+				part = cut(part, math.max(0, ARTICLE_TEXT_MAX - used)) .. "\n\n\u{2026}"
+				b.text = part
+				table.insert(text_parts, part)
+				for j = #blocks, i + 1, -1 do
+					table.remove(blocks, j)
+				end
+			else
+				for j = #blocks, i, -1 do
+					table.remove(blocks, j)
+				end
+			end
+			break
+		end
+		used += #part
+		table.insert(text_parts, part)
 	end
-	local text = table.concat(text_parts, "\n")
-	if #text > ARTICLE_TEXT_MAX then
-		text = string.sub(text, 1, ARTICLE_TEXT_MAX) .. "\n\n\u{2026}"
-	end
-	return { blocks = blocks, text = text }
+	return { blocks = blocks, text = table.concat(text_parts, "\n") }
 end
 
 return feed
