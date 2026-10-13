@@ -45,6 +45,9 @@ type State = {
 local IMAGE_BYTES_MAX = 4 * 1024 * 1024
 -- How often the block checks its target file (and that its pane still exists).
 local POLL_MS = 500
+-- How long a click newer than the one a reader was launched for stays believable: the window may
+-- take a moment to start the reader, and an older file means the link is stale or hand-made.
+local FRESH_S = 30
 
 -- Fetches one image and stores its blob id, then renders. Failures mark the source as "" and the
 -- view draws its alt text instead: a source tern.fetch refuses (it raises), a bad status, an
@@ -108,15 +111,25 @@ local reader: BlockDef<State> = {
 		local owner = tonumber(args[2])
 		local state: State = { target = raw, phase = "fetching", gen = 0 }
 		-- The newest click this reader has applied. A click is anything the target file holds
-		-- under another number; a reader opened by a hand-made link (no number) starts from
-		-- whatever the file holds now, which is an older click's.
+		-- under another number. A link's own number is only believed when the file agrees with it
+		-- or is newer and was written just now: a hand-made link (any `seq` it likes) or a click
+		-- whose file write failed would otherwise show the file's older article instead of the
+		-- link's, so a stale file is taken as already applied. A reader opened with no number
+		-- starts from whatever the file holds, which is an older click's.
 		local launched = tonumber(args[3])
 		local seen_seq: number
-		if launched then
+		local latest = if owner then target_file.read(owner) else nil
+		local fresh = latest ~= nil
+			and launched ~= nil
+			and latest.seq > launched
+			and latest.at ~= nil
+			and latest.at >= os.time() - FRESH_S
+		if launched and (latest == nil or latest.seq == launched or fresh) then
 			seen_seq = launched
+		elseif latest then
+			seen_seq = latest.seq
 		else
-			local latest = if owner then target_file.read(owner) else nil
-			seen_seq = if latest then latest.seq else 0
+			seen_seq = 0
 		end
 
 		-- Whether this pane still exists; once it doesn't, nothing here renders or opens anything

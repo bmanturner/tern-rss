@@ -1,7 +1,7 @@
 --!strict
 -- The channel from an RSS block's clicks to the reader beside it; host half only (tern.fs on the
 -- host's own data folder, which is where the RSS block and the readers it opens both run, local or
--- remote). The RSS block writes `reader-<its pane>.json` ({url, seq}) before it opens the link
+-- remote). The RSS block writes `reader-<its pane>.json` ({url, seq, at}: `at` is os.time()) before it opens the link
 -- route; a reader launched for that pane polls the file, so it always follows the latest click,
 -- including clicks made while it was starting or failing over to the browser. The window half
 -- never touches it. Files stay behind when a pane closes: they are a few bytes, keyed by RSS pane
@@ -11,7 +11,7 @@
 
 local target = {}
 
-export type Target = { url: string, seq: number }
+export type Target = { url: string, seq: number, at: number? }
 
 local dir_ready = false
 
@@ -34,11 +34,11 @@ function target.read(owner: number): Target?
 	if not decode_ok or type(doc) ~= "table" then
 		return nil
 	end
-	local u, seq = (doc :: any).url, (doc :: any).seq
+	local u, seq, at = (doc :: any).url, (doc :: any).seq, (doc :: any).at
 	if type(u) ~= "string" or type(seq) ~= "number" then
 		return nil
 	end
-	return { url = u, seq = seq }
+	return { url = u, seq = seq, at = if type(at) == "number" then at else nil }
 end
 
 -- Records a click on `u` for RSS pane `owner` and returns its number (one past the file's last).
@@ -50,7 +50,7 @@ function target.write(owner: number, u: string): number
 	local prev = target.read(owner)
 	local seq = (if prev then prev.seq else 0) + 1
 	local ok, err = pcall(function(): nil
-		tern.fs.write(path(owner), tern.json.encode({ url = u, seq = seq }))
+		tern.fs.write(path(owner), tern.json.encode({ url = u, seq = seq, at = os.time() }))
 		return nil
 	end)
 	if not ok then

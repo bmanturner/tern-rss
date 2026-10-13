@@ -1139,7 +1139,17 @@ for byte = 0x80, 0xFF do
 	WIDE[string.char(byte)] = utf8.char(cp1252(byte))
 end
 -- Charset names (lowercase, without "-" and "_") read as windows-1252, like browsers read latin-1.
-local LATIN1: { [string]: boolean } = { iso88591 = true, latin1 = true, l1 = true, windows1252 = true, cp1252 = true }
+local LATIN1: { [string]: boolean } = {
+	iso88591 = true,
+	latin1 = true,
+	l1 = true,
+	windows1252 = true,
+	cp1252 = true,
+	iso885915 = true,
+}
+-- Declared names that may still hold bytes that aren't UTF-8 (a truncated page, a wrong label):
+-- repaired. Any other declared charset that isn't UTF-8 can't be decoded here.
+local UTF8_LIKE: { [string]: boolean } = { utf8 = true, ascii = true, usascii = true }
 
 -- The charset a page declares: the Content-Type header's, else a <meta> in the first 2 KB.
 local function page_charset(body: string, content_type: string?): string?
@@ -1155,16 +1165,19 @@ local function page_charset(body: string, content_type: string?): string?
 end
 
 -- `body` as valid UTF-8, which the view needs (Tern raises on anything else): a latin-1 or
--- windows-1252 page is widened through the cp1252 table, and any other bytes that aren't UTF-8
--- (a charset this plugin has no table for) are mapped the same way, so the page stays readable
--- instead of failing every render.
-local function page_utf8(body: string, content_type: string?): string
+-- windows-1252 page is widened through the cp1252 table; a page that declares another charset and
+-- isn't UTF-8 gives nil (it can't be decoded here); undeclared bytes that aren't UTF-8 are mapped
+-- the same way, so the page stays readable instead of failing every render.
+local function page_utf8(body: string, content_type: string?): string?
 	local charset = page_charset(body, content_type)
 	if charset and LATIN1[charset] then
 		return (string.gsub(body, "[\128-\255]", WIDE))
 	end
 	if utf8.len(body) then
 		return body
+	end
+	if charset and not UTF8_LIKE[charset] then
+		return nil
 	end
 	local out: { string } = {}
 	local from = 1
@@ -1402,7 +1415,7 @@ local function image_src(attrs: { [string]: string }, base: string, private_ok: 
 end
 
 -- Subtrees that are page furniture, not the article: dropped whole, counting nested ones of the
--- same name. `header` is the article's own byline when the container is an <article>.
+-- same name. `header` is kept inside an <article> (its title and byline).
 local FURNITURE: { [string]: boolean } = {
 	nav = true,
 	aside = true,
@@ -1414,8 +1427,9 @@ local FURNITURE: { [string]: boolean } = {
 
 -- What an opening tag leaves in the text, and what a closing one that ends a block does after the
 -- text so far is flushed.
-local OPEN_BREAK: { [string]: string } = { p = "\n\n", div = "\n\n", dd = "\n\n", dt = "\n\n", table = "\n\n" }
-local CLOSE_BREAK: { [string]: string } = { p = "\n\n", div = "\n", table = "\n\n" }
+local OPEN_BREAK: { [string]: string } =
+	{ p = "\n\n", div = "\n\n", dd = "\n\n", dt = "\n\n", table = "\n\n", figure = "\n\n", figcaption = "\n\n" }
+local CLOSE_BREAK: { [string]: string } = { p = "\n\n", div = "\n", table = "\n\n", figure = "\n\n", figcaption = "\n\n" }
 
 -- Walks `inner` (the container's source) into blocks. `furniture` drops FURNITURE subtrees; the
 -- second result says whether any was dropped. The walk is the preview's html_to_text with
@@ -1439,6 +1453,8 @@ local function render(inner: string, kind: string, base: string, furniture: bool
 	local cells = 0 -- cells so far in the current row
 	local skip_name: string? = nil
 	local skip_depth = 0
+	-- <article>s open at this point of the walk; the container's own tag isn't in `inner`.
+	local article_depth = if kind == "article" then 1 else 0
 	local dropped = false
 	-- Page text queued since the last flush, and whether the walk has read all it will ship: a
 	-- page that is all one paragraph never flushes, so the queue is bounded by the source read
@@ -1527,8 +1543,19 @@ local function render(inner: string, kind: string, base: string, furniture: bool
 			end
 			return nil
 		end
-		-- An article's own <header> holds its title and byline, so only other headers are furniture.
-		local own_header = kind == "article" and name == "header"
+		if not closing and name == "article" then
+			article_depth += 1
+		elseif closing and name == "article" then
+			article_depth = math.max(0, article_depth - 1)
+		end
+		-- <noscript> repeats what the page's scripts build (the same lazy image, "enable
+		-- JavaScript"), so it is never read; and an <article>'s own <header> holds its title and
+		-- byline, so only a header outside every <article> is furniture.
+		if not closing and name == "noscript" then
+			skip_name, skip_depth = name, 1
+			return nil
+		end
+		local own_header = name == "header" and article_depth > 0
 		if furniture and not closing and FURNITURE[name] and not own_header then
 			skip_name, skip_depth, dropped = name, 1, true
 			return nil
@@ -1571,13 +1598,21 @@ local function render(inner: string, kind: string, base: string, furniture: bool
 			trim_tail()
 			pending = "li"
 		elseif name == "ul" or name == "ol" then
-			table.insert(lists, { ordered = name == "ol", n = 0 })
+			local start = 1
+			if name == "ol" and gt - lt < TAG_MAX then
+				local n = tonumber(string.match(decode_attrs(string.sub(inner, lt, gt), true).start or "", "^%s*(%d+)%s*$"))
+				if n and n < 1_000_000_000 then
+					start = n
+				end
+			end
+			table.insert(lists, { ordered = name == "ol", n = start - 1 })
 			table.insert(buf, "\n")
 		elseif name == "blockquote" then
 			flush()
 			quotes += 1
 		elseif name == "br" then
-			table.insert(buf, "\5\n")
+			-- A line break inside a heading stays in the heading: a new line would end it.
+			table.insert(buf, if in_heading then " " else "\5\n")
 		elseif name == "tr" then
 			cells = 0
 		elseif name == "td" or name == "th" then
@@ -1658,6 +1693,11 @@ end
 -- container scan and the walk each read it once (see `walk`).
 function feed.article(body: string, base: string, content_type: string?): Article
 	local html = page_utf8(cut(body, ARTICLE_SOURCE_MAX), content_type)
+	if html == nil then
+		-- A legacy multi-byte charset (GBK, Shift_JIS, ...): decoding it would garble the page, so
+		-- say there is nothing to read and let the browser show it.
+		return { blocks = {}, text = "" }
+	end
 	local kind, inner = article_container(html, string.lower(html))
 	if inner == "" then
 		return { blocks = {}, text = "" }

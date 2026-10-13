@@ -63,10 +63,27 @@ local function same_tab(cx: WindowCx, a: number, b: number): boolean
 	return x == nil or y == nil or x == y
 end
 
--- Records `art` as RSS pane `owner`'s article pane, or forgets it when nil.
-local function record(owner: number, art: Article?)
+-- Whether `pane` is one of this plugin's RSS blocks in this window's session: a forged link names
+-- no real pane, or some other pane.
+local function is_rss_pane(cx: WindowCx, pane: number): boolean
+	local info = pane_info(cx, pane)
+	return info ~= nil and info.kind == "plugin" and info.block == tern.plugin.id .. ".rss"
+end
+
+-- Records `art` as RSS pane `owner`'s article pane, or forgets it when nil. Pane ids start again
+-- after a restart while this map outlives it, so the write also drops what can no longer be
+-- true: another owner's entry for the same article pane (the id now names a pane `owner` opened),
+-- and entries whose RSS pane isn't an open RSS block any more.
+local function record(cx: WindowCx, owner: number, art: Article?)
 	local ok, all = pcall(tern.kv.get, ARTICLES_KEY)
 	local map: { [string]: any } = if ok and type(all) == "table" then table.clone(all :: any) else {}
+	for key, entry in map do
+		local other = tonumber(key)
+		local same_pane = art ~= nil and type(entry) == "table" and entry.pane == art.pane
+		if other ~= owner and (same_pane or other == nil or not is_rss_pane(cx, other)) then
+			map[key] = nil
+		end
+	end
 	map[tostring(owner)] = if art then { pane = art.pane, kind = art.kind } else nil
 	pcall(tern.kv.set, ARTICLES_KEY, map)
 end
@@ -93,7 +110,7 @@ local function live_article(cx: WindowCx, owner: number): Article?
 	local same = info ~= nil
 		and if art.kind == "browser" then info.kind == "browser" else info.kind == "plugin" and info.block == READER_BLOCK
 	if not same or not same_tab(cx, owner, art.pane) then
-		record(owner, nil)
+		record(cx, owner, nil)
 		return nil
 	end
 	return art
@@ -151,7 +168,7 @@ local function open_browser(cx: WindowCx, owner: number, target: string, replace
 			return
 		end
 		if block then
-			record(owner, { pane = block, kind = "browser" })
+			record(wcx, owner, { pane = block, kind = "browser" })
 			wcx.layout:dock(block, owner, "right", { focus = false })
 			if replace and replace ~= block then
 				close_article(wcx, replace)
@@ -195,7 +212,7 @@ local function show_reader(cx: WindowCx, owner: number, target: string, seq: str
 		show_browser(cx, owner, target, nil)
 		return
 	end
-	record(owner, { pane = block, kind = "reader" })
+	record(cx, owner, { pane = block, kind = "reader" })
 	cx.layout:dock(block, owner, "right", { focus = false })
 	if art then
 		close_article(cx, art.pane)
@@ -236,13 +253,6 @@ local function ask_carly(cx: WindowCx, id: string)
 		tern.log.warn("tern-rss: ask_carly failed", err)
 		answer(id, nil, "Carly isn't available in this window.")
 	end
-end
-
--- Whether `pane` is one of this plugin's RSS blocks in this window's session: a forged link names
--- no real pane, or some other pane.
-local function is_rss_pane(cx: WindowCx, pane: number): boolean
-	local info = pane_info(cx, pane)
-	return info ~= nil and info.kind == "plugin" and info.block == tern.plugin.id .. ".rss"
 end
 
 tern.carly.export("found", {
