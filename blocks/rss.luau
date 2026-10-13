@@ -2,22 +2,32 @@
 -- The `rss` block (host half): a river of headlines under three tabs (Latest, ★ Favorites, Feeds).
 -- Feeds, read state, caches and polling live in lib/store, shared by every RSS block; this file is the
 -- view, the keys and the clicks. Articles open through the window's `tern-rss://read/<pane>` route,
--- which docks one reader browser beside the block and reuses it.
+-- which docks one article pane (the native reader, or Tern's browser) beside the block and reuses it.
 
 local store = require("../lib/store")
 local url = require("../lib/url")
 local fmt = require("../lib/fmt")
 local cards = require("../lib/cards")
+local filter = require("../lib/filter")
+local config = require("../lib/config")
+local target_file = require("../lib/target")
 
 local ui = tern.ui
 local span = ui.span
 
 type Tab = "latest" | "favorites" | "feeds"
 
+-- What the one-line field does on Enter.
+type Intent = "add" | "folder" | "rule" | "feed"
+
+-- The one-line field, and what it is for: following a feed, setting the selected feed's group,
+-- adding a filter rule, or editing a feed. `target` is the feed id for "folder" and "feed".
 type Field = {
 	text: string,
 	-- Byte offset of the caret (bytes before it).
 	cursor: number,
+	intent: Intent,
+	target: string?,
 }
 
 type State = {
@@ -32,6 +42,13 @@ type State = {
 	preview: boolean,
 	-- The add field, while it is open.
 	adding: Field?,
+	-- The Latest tab's filter panel: whether it is up, and the row it points at (see panel_rows).
+	panel: boolean,
+	panel_at: number,
+	-- A timer is already set to finish judging the posts the filter has not reached (see judge).
+	judging: boolean,
+	-- What the last render's judging came to, for the keys and clicks that follow it (see snapshot).
+	latest: Latest?,
 	-- The field whose add request is in flight; a closed field's request reports by toast.
 	add_busy: Field?,
 	add_error: string?,
@@ -99,30 +116,115 @@ local function any_favorite(): boolean
 	return false
 end
 
--- The headlines a tab draws, at most MAX_ROWS: posts new since the last catch-up first, then the
--- rest, each group newest first. Also returns how many were left out and how many rows are new.
-local function headlines(tab: Tab): ({ store.Item }, number, number)
+-- What the Latest filter makes of the posts. Matching a pattern costs far more than a render may,
+-- so the result is a snapshot: `shown` holds the keys of the posts the filter lets through, `hidden`
+-- counts those it hides, and `pending` those it has not reached yet (they are neither).
+type Latest = { active: boolean, shown: { [string]: boolean }, hidden: number, pending: number }
+
+-- The most one host call spends starting new pattern tests, a share of the 2 s the host allows a
+-- handler. The budget is checked before each test, so a call can run one test past it, and a test is
+-- cut off at the engine's step limit: measured on an 840-character text, 0.16 s with the JIT and
+-- 0.21 s without (`(?=(?:.?){900})x`; review saw up to 0.24 s and 0.31 s). A call is therefore the
+-- budget plus one such test plus the lookups, about 0.35 s at worst, and a pass that finds the
+-- budget gone starts no test.
+local JUDGE_BUDGET = 0.1
+
+-- Judges every post once for the Latest tab. filter.visible remembers what each pattern said about a
+-- post, so only posts that are new or changed cost anything here; the rest is a lookup. When the
+-- budget runs out before every post is judged, a timer renders again and the next call carries on.
+-- `budget` is the seconds to spend on new tests, for the whole call: a handler passes 0 and gets
+-- lookups only. The result is kept in `state.latest`.
+local function judge(state: State, budget: number): Latest
+	local cfg = store.filter()
+	local latest: Latest = { active = filter.active(cfg), shown = {}, hidden = 0, pending = 0 }
+	state.latest = latest
+	if not latest.active then
+		return latest
+	end
+	local feeds: { [string]: store.Feed } = {}
+	for _, f in store.feeds() do
+		feeds[f.id] = f
+	end
+	local items = store.items()
+	-- A rule that gives up on a post is skipped from then on, so the posts judged before that were
+	-- judged with a rule the rest are not: the pass runs again (all lookups, and the one budget is
+	-- already spent) until a whole pass ran with the rules it ended with. Every extra pass skips one
+	-- more rule, so there are at most as many as rules, plus the last.
+	filter.budget(budget)
+	for _ = 1, #cfg.rules + 1 do
+		local skipped = filter.skipped_count(cfg)
+		latest.shown, latest.hidden, latest.pending = {}, 0, 0
+		for _, it in items do
+			local shown = filter.visible(cfg, it, feeds[it.feed], store.is_read(it.key))
+			if shown == nil then
+				latest.pending += 1
+			elseif shown then
+				latest.shown[it.key] = true
+			else
+				latest.hidden += 1
+			end
+		end
+		if filter.skipped_count(cfg) == skipped then
+			break
+		end
+	end
+	filter.budget(nil)
+	filter.sweep(cfg, items, latest.pending == 0)
+	if latest.pending > 0 and not state.judging then
+		state.judging = true
+		-- 50 ms between slices, so keys and other blocks get the host between them.
+		tern.timer(50, function()
+			state.judging = false
+			pcall(function()
+				state.cx:render()
+			end)
+		end)
+	end
+	return latest
+end
+
+-- The Latest snapshot the last render drew, for key and click handlers: they act on what the user
+-- sees, and judging again here would spend a second budget before view spends its own. A handler
+-- that runs before any render looks up what is already judged and tests nothing.
+local function snapshot(state: State): Latest
+	return state.latest or judge(state, 0)
+end
+
+-- For the tabs the filter does not scope.
+local UNFILTERED: Latest = { active = false, shown = {}, hidden = 0, pending = 0 }
+
+local function is_shown(latest: Latest, key: string): boolean
+	return not latest.active or latest.shown[key] == true
+end
+
+-- Every post a tab shows, posts new since the last catch-up first, then the rest, each group newest
+-- first; and how many of them are new. The filter scopes the Latest tab; Favorites stays the starred
+-- feeds as they are.
+local function shown_items(tab: Tab, latest: Latest): ({ store.Item }, number)
 	local fresh: { store.Item } = {}
 	local older: { store.Item } = {}
 	for _, it in store.items() do
 		if tab ~= "favorites" or is_favorite(it) then
-			if store.is_new(it) then
-				table.insert(fresh, it)
-			else
-				table.insert(older, it)
+			if tab ~= "latest" or is_shown(latest, it.key) then
+				if store.is_new(it) then
+					table.insert(fresh, it)
+				else
+					table.insert(older, it)
+				end
 			end
 		end
 	end
-	local out: { store.Item } = {}
-	for _, group in { fresh, older } do
-		for _, it in group do
-			if #out >= MAX_ROWS then
-				break
-			end
-			table.insert(out, it)
-		end
-	end
-	return out, #fresh + #older - #out, math.min(#fresh, MAX_ROWS)
+	local n_fresh = #fresh
+	table.move(older, 1, #older, n_fresh + 1, fresh)
+	return fresh, n_fresh
+end
+
+-- The headlines a tab draws, at most MAX_ROWS. Also returns how many were left out and how many rows
+-- are new. `latest` is the snapshot when the caller already took one; otherwise the last render's.
+local function headlines(state: State, tab: Tab, latest: Latest?): ({ store.Item }, number, number)
+	local all, n_fresh = shown_items(tab, if tab == "latest" then latest or snapshot(state) else UNFILTERED)
+	local out = table.move(all, 1, math.min(#all, MAX_ROWS), 1, {})
+	return out, #all - #out, math.min(n_fresh, MAX_ROWS)
 end
 
 local function sel_key(state: State): string?
@@ -164,15 +266,57 @@ local function selected_item(state: State, rows: { store.Item }): (store.Item?, 
 	return rows[i], i
 end
 
+-- One entry per row the Feeds list draws: a folder header (`name`) or a feed. Once the user groups
+-- anything the list is one header per folder, each above its own feeds, ungrouped last; a flat
+-- subscription list draws as it always did. Headers are not selectable, so selection stays on feed
+-- ids. Also returns the feeds alone in that same order and how many headers there are: j/k, the
+-- fallback selection and removal must all walk the order the screen shows, not subscription order.
+local function drawn_feeds(): ({ { name: string?, feed: store.Feed? } }, { store.Feed }, number)
+	local folders = store.folders()
+	local grouped = #folders > 1 or (folders[1] ~= nil and folders[1] ~= filter.UNGROUPED)
+	local drawn: { { name: string?, feed: store.Feed? } } = {}
+	local order: { store.Feed } = {}
+	if grouped then
+		for _, name in folders do
+			table.insert(drawn, { name = name, feed = nil })
+			for _, f in store.feeds_in(name) do
+				table.insert(drawn, { name = nil, feed = f })
+				table.insert(order, f)
+			end
+		end
+	else
+		for _, f in store.feeds() do
+			table.insert(drawn, { name = nil, feed = f })
+			table.insert(order, f)
+		end
+	end
+	return drawn, order, if grouped then #folders else 0
+end
+
 local function selected_feed(state: State, feeds: { store.Feed }): (store.Feed?, number)
+	local want = state.sel.feeds
+	if want == nil then
+		return feeds[1], 1
+	end
 	for i, f in feeds do
-		if f.id == state.sel.feeds then
+		if f.id == want then
 			return f, i
+		end
+	end
+	-- A retarget in this or another block re-keyed the feed: follow it instead of jumping to the top.
+	local moved_to = store.resolve(want)
+	if moved_to ~= want then
+		for i, f in feeds do
+			if f.id == moved_to then
+				state.sel.feeds = moved_to
+				return f, i
+			end
 		end
 	end
 	return feeds[1], 1
 end
 
+-- The row index of the remembered selection, or 1 when it is gone (selected_item's fallback).
 local function find_item(key: string): store.Item?
 	for _, it in store.items() do
 		if it.key == key then
@@ -182,35 +326,172 @@ local function find_item(key: string): store.Item?
 	return nil
 end
 
--- New unread posts: all, favorite feeds only, and per feed id.
-local function tally(): (number, number, { [string]: number })
-	local all, fav = 0, 0
+-- Filter panel --------------------------------------------------------------------------------------
+--
+-- The Latest tab's filter editor: the read-state row, then the all-groups row, one row per
+-- subscription group, then one per rule in the order the rules are read. panel_rows is the one
+-- source of that order, shared by the view and the keys, so a key always acts on the row under the
+-- cursor.
+
+-- Which kind of row a panel line is.
+type RowKind = "read" | "all" | "group" | "rule"
+
+-- `key` is the row's key in the list, which is what a click reports back.
+type PanelRow = { kind: RowKind, key: string, name: string?, index: number? }
+
+local function panel_rows(): { PanelRow }
+	local rows: { PanelRow } = {
+		{ kind = "read", key = "read", name = nil, index = nil },
+		{ kind = "all", key = "all", name = nil, index = nil },
+	}
+	for _, name in store.folders() do
+		table.insert(rows, { kind = "group", key = "g:" .. name, name = name, index = nil })
+	end
+	for i = 1, #store.filter().rules do
+		table.insert(rows, { kind = "rule", key = "r" .. i, name = nil, index = i })
+	end
+	return rows
+end
+
+-- A short summary of the filter for the status line above the headlines.
+local function describe_filter(cfg: filter.Config): string
+	local groups, excluded = 0, 0
+	for _ in pairs(cfg.groups) do
+		groups += 1
+	end
+	for _ in pairs(cfg.excluded) do
+		excluded += 1
+	end
+	local out: { string } = {}
+	if cfg.read ~= "all" then
+		table.insert(out, cfg.read .. " only")
+	end
+	if groups > 0 then
+		table.insert(out, plural(groups, "group", "groups") .. " in")
+	end
+	if excluded > 0 then
+		table.insert(out, plural(excluded, "group", "groups") .. " out")
+	end
+	if #cfg.rules > 0 then
+		table.insert(out, plural(#cfg.rules, "rule", "rules"))
+	end
+	return if #out == 0 then "off" else table.concat(out, " · ")
+end
+
+-- Space checks a group, `x` excludes it. Checking a group is what keeps it in the Latest tab; with
+-- nothing checked every group is in. A group is never both, and space on the all-groups row unchecks
+-- them all. The read row steps a single cycle instead: every post, unread only, read only.
+local function panel_toggle(row: PanelRow, pressed: string): boolean
+	local cfg = store.filter()
+	local name = row.name
+	if row.kind == "read" then
+		if pressed ~= "space" and pressed ~= "x" then
+			return false
+		end
+		cfg.read = filter.next_read(cfg.read)
+	elseif row.kind == "all" and pressed == "space" then
+		if next(cfg.groups) == nil then
+			return false
+		end
+		cfg.groups = {}
+	elseif row.kind == "group" and name ~= nil then
+		if pressed == "space" then
+			if cfg.groups[name] then
+				cfg.groups[name] = nil
+			else
+				cfg.groups[name] = true
+				cfg.excluded[name] = nil
+			end
+		elseif pressed == "x" then
+			if cfg.excluded[name] then
+				cfg.excluded[name] = nil
+			else
+				cfg.excluded[name] = true
+				cfg.groups[name] = nil
+			end
+		else
+			return false
+		end
+	else
+		return false
+	end
+	store.set_filter(cfg)
+	return true
+end
+
+-- K and J move a rule, which changes the order the rules are read in.
+local function panel_move_rule(state: State, index: number, up: boolean, at: number): boolean
+	local cfg = store.filter()
+	local to = if up then index - 1 else index + 1
+	local moved = cfg.rules[index]
+	if moved == nil or to < 1 or to > #cfg.rules then
+		return false
+	end
+	table.remove(cfg.rules, index)
+	table.insert(cfg.rules, to, moved)
+	store.set_filter(cfg)
+	state.panel_at = at + (if up then -1 else 1)
+	return true
+end
+
+local function panel_delete_rule(state: State, index: number): boolean
+	local cfg = store.filter()
+	if cfg.rules[index] == nil then
+		return false
+	end
+	table.remove(cfg.rules, index)
+	store.set_filter(cfg)
+	state.panel_at = math.clamp(state.panel_at, 1, #panel_rows())
+	return true
+end
+
+-- What `a` fills the rule field with: the group under the cursor, when there is one.
+local function panel_prefill(row: PanelRow): string
+	if row.kind == "group" and row.name ~= nil and row.name ~= filter.UNGROUPED then
+		return filter.scope_text({ kind = "group", name = row.name }) .. " "
+	end
+	return ""
+end
+
+-- New unread posts: those from favorite feeds, per feed id, and those the Latest filter shows.
+local function tally(latest: Latest): (number, { [string]: number }, number)
+	local fav, shown = 0, 0
 	local per: { [string]: number } = {}
 	for _, it in store.items() do
 		if not store.is_read(it.key) and store.is_new(it) then
-			all += 1
 			per[it.feed] = (per[it.feed] or 0) + 1
 			if is_favorite(it) then
 				fav += 1
 			end
+			if is_shown(latest, it.key) then
+				shown += 1
+			end
 		end
 	end
-	return all, fav, per
+	return fav, per, shown
 end
 
--- Feed ids a catch-up covers: every feed on Latest, starred ones on Favorites, the selected one on Feeds.
+-- Feed ids a catch-up covers: on Latest the feeds the filter's groups keep, starred ones on
+-- Favorites, the selected one on Feeds. Posts a rule hides are caught up with their feed.
 local function catch_up_scope(state: State): { string }
 	local ids: { string } = {}
 	local feeds = store.feeds()
 	if state.tab == "feeds" then
-		local f = selected_feed(state, feeds)
+		local _, order = drawn_feeds()
+		local f = selected_feed(state, order)
 		if f then
 			table.insert(ids, f.id)
 		end
 		return ids
 	end
+	local cfg = store.filter()
+	local gated = state.tab == "latest" and filter.active(cfg)
 	for _, f in feeds do
-		if state.tab == "latest" or f.favorite then
+		if state.tab == "latest" then
+			if not gated or filter.group_allows(cfg, filter.group(f)) then
+				table.insert(ids, f.id)
+			end
+		elseif f.favorite then
 			table.insert(ids, f.id)
 		end
 	end
@@ -259,6 +540,38 @@ local function paragraphs(text: string): { string }
 	return out
 end
 
+-- Splits the edit field into a title and a URL; both come back trimmed, and empty strings come back
+-- nil, which is what store.rename reads as "keep this one". The URL is the text from the first
+-- `scheme://` that starts the line or follows a space (so the `.S` of `K.I.S.S` is no scheme). With
+-- no scheme, a final token that looks like `host.tld/path` still counts, so `Title example.com/feed`
+-- retargets; a dotted title such as `Node.js` has no path and stays a title. With neither, the whole
+-- line is the title.
+local function split_feed_fields(text: string): (string?, string?)
+	-- Unicode spaces (NBSP, U+3000) split like an ASCII one; %s knows only the latter.
+	local s = fmt.trim(fmt.normalize_blanks(text))
+	if s == "" then
+		return nil, nil
+	end
+	local at = string.find(s, "^[%w+.-]+://")
+	if at == nil then
+		-- The space is matched too, so the URL starts one byte later.
+		local space = string.find(s, "%s[%w+.-]+://")
+		at = if space then space + 1 else nil
+	end
+	if at == nil then
+		local token = string.match(s, "(%S+)$") or ""
+		local host, path = string.match(token, "^([%w-]+%.[%w.-]*%.?%a%a+)(/.+)$")
+		if host == nil or path == nil or string.find(host, "%.%.") or url.normalize(token) == nil then
+			return s, nil
+		end
+		at = #s - #token + 1
+	end
+	local start = at :: number -- the scheme search found it, or the bare host-and-path token did
+	local title = fmt.trim(string.sub(s, 1, start - 1))
+	local u = fmt.trim(string.sub(s, start))
+	return if title == "" then nil else title, if u == "" then nil else u
+end
+
 -- Add field ------------------------------------------------------------------------------------------
 
 local function is_cont(b: number?): boolean
@@ -283,13 +596,15 @@ local function char_after(text: string, cursor: number): number
 	return en
 end
 
-local function open_field(state: State, cx: BlockCx, prefill: string?)
+-- Opens the one-line field. `intent` decides what Enter does: "add" follows a feed and jumps to the
+-- Feeds tab, "folder" groups `target`, "rule" appends a filter rule on the Latest panel.
+local function open_field(state: State, cx: BlockCx, intent: Intent, prefill: string?, target: string?)
 	local text = prefill or ""
-	state.adding = { text = text, cursor = #text }
+	state.adding = { text = text, cursor = #text, intent = intent, target = target }
 	state.add_error = nil
 	state.missed = nil
 	state.confirm = nil
-	if #store.feeds() > 0 then
+	if intent == "add" and #store.feeds() > 0 then
 		state.tab = "feeds"
 	end
 	-- Draw the field first, so the focus op finds it.
@@ -305,13 +620,137 @@ local function close_field(state: State, cx: BlockCx)
 end
 
 -- The add field is drawn on the welcome view and the Feeds tab only.
-local function field_shown(state: State): boolean
+-- Whether the current view draws the field: the add and group fields live on the welcome view and
+-- the Feeds tab, the rule field on the latest panel.
+-- Whether the view where `intent`'s field belongs is the view now: the add, group and feed fields
+-- live on the welcome view and the Feeds tab, the rule field on the Latest panel.
+local function field_view(state: State, intent: Intent): boolean
+	if intent == "rule" then
+		return state.panel and state.tab == "latest"
+	elseif intent == "folder" or intent == "feed" then
+		return state.tab == "feeds"
+	end
 	return state.tab == "feeds" or #store.feeds() == 0
+end
+
+-- Whether the open field is drawn where the view is now. A field whose view is gone is closed.
+local function field_shown(state: State): boolean
+	local field = state.adding
+	return field ~= nil and field_view(state, field.intent)
+end
+
+-- Whether the view now is one with the no-feed offer beside the add field.
+local function offer_shown(state: State): boolean
+	return state.tab == "feeds" or #store.feeds() == 0
+end
+
+-- The group field is synchronous: it writes the folder and closes. An empty line clears the group.
+local function submit_folder(state: State, cx: BlockCx, field: Field)
+	-- The field names the id it was opened on; a retarget since then re-keyed the feed.
+	local target = if field.target then store.resolve(field.target) else nil
+	local name = field.text
+	close_field(state, cx)
+	if target == nil then
+		return
+	end
+	if not store.set_folder(target, name) then
+		cx:toast("info", "That feed is gone")
+		return
+	end
+	-- The stored name is trimmed and clipped, so the toast reads back what was kept.
+	local kept = store.feed(target)
+	local group = if kept then kept.folder else nil
+	cx:toast("success", if group == nil or group == "" then "Left its group" else "Grouped under " .. group)
+end
+
+-- The rule field appends to the end of the rule list; a line that doesn't parse stays in the field
+-- with the reason under it.
+local function submit_rule(state: State, cx: BlockCx, field: Field)
+	local rule, err = filter.parse(field.text)
+	if rule == nil then
+		state.add_error = err
+		cx:render()
+		return
+	end
+	local cfg = store.filter()
+	table.insert(cfg.rules, rule)
+	close_field(state, cx)
+	-- store.set_filter renders, and the cursor follows the rule the user just added.
+	state.panel_at = #panel_rows()
+	store.set_filter(cfg)
+end
+
+-- The feed field edits the selected feed: `title` and `url`. A title, a URL, or both, in that order;
+-- one field holds both, so the user sees the whole feed on one line.
+local function submit_feed(state: State, cx: BlockCx, field: Field)
+	local target = field.target
+	local text = field.text
+	if target == nil then
+		close_field(state, cx)
+		return
+	end
+	local title, u = split_feed_fields(text)
+	if title == nil and u == nil then
+		state.add_error = "Type a title, a URL, or a title and a URL in one line"
+		cx:render()
+		return
+	end
+	if store.resolve(target) ~= target then
+		-- The prefilled URL is the old one: submitting it would retarget the feed back.
+		state.add_error = "This feed changed while you were editing. Press esc, then e again."
+		cx:render()
+		return
+	end
+	if store.feed(target) == nil then
+		close_field(state, cx)
+		cx:toast("info", "That feed is gone")
+		return
+	end
+	-- A retarget probes the network, so the field stays open meanwhile (as the add field does): on a
+	-- refusal the user still has what they typed, and nothing but the message changed.
+	state.add_busy = field
+	state.add_error = nil
+	local ok = store.rename(target, title or "", u or "", function(err: string?, _new_id: string?)
+		if state.add_busy == field then
+			state.add_busy = nil
+		end
+		-- Selection needs no fix here: selected_feed follows a re-keyed feed in every block.
+		if state.adding == field then
+			if err then
+				state.add_error = err
+				cx:render()
+				return
+			end
+			close_field(state, cx)
+		elseif err then
+			cx:toast("error", "Couldn't update that feed", err)
+			return
+		end
+		cx:toast("success", "Updated")
+		cx:render()
+	end)
+	if not ok then
+		if state.add_busy == field then
+			state.add_busy = nil
+		end
+		close_field(state, cx)
+		cx:toast("info", "Nothing to change")
+	end
 end
 
 local function submit(state: State, cx: BlockCx)
 	local field = state.adding
 	if field == nil or state.add_busy == field then
+		return
+	end
+	if field.intent == "folder" then
+		submit_folder(state, cx, field)
+		return
+	elseif field.intent == "rule" then
+		submit_rule(state, cx, field)
+		return
+	elseif field.intent == "feed" then
+		submit_feed(state, cx, field)
 		return
 	end
 	state.add_busy = field
@@ -392,6 +831,10 @@ local function field_key(state: State, f: Field, k: Key, cx: BlockCx): boolean
 	elseif k.name == "end" then
 		f.cursor = #text
 		return true
+	elseif k.name == "space" and (k.text == nil or k.text == "") and not (k.ctrl or k.meta) then
+		-- A space key that carries no text still types a space, so a field never silently eats it.
+		f.text = string.sub(text, 1, cursor) .. " " .. string.sub(text, cursor + 1)
+		f.cursor = cursor + 1
 	elseif k.text and k.text ~= "" and not (k.ctrl or k.meta) then
 		f.text = string.sub(text, 1, cursor) .. k.text .. string.sub(text, cursor + 1)
 		f.cursor = cursor + #k.text
@@ -400,6 +843,48 @@ local function field_key(state: State, f: Field, k: Key, cx: BlockCx): boolean
 	end
 	state.add_error = nil
 	return true
+end
+
+-- The panel's keys. Escape and f close it; space and x change the group under the cursor; a opens
+-- the rule field, d deletes a rule, K and J move one in the order the rules are read.
+local function panel_key(state: State, k: Key, cx: BlockCx): boolean
+	local rows = panel_rows()
+	local at = math.clamp(state.panel_at, 1, #rows)
+	-- The stored row can be out of range (a group vanished while the panel was open); the cursor
+	-- moves from the row that is drawn, so K and J keep it on the rule they moved.
+	state.panel_at = at
+	local row = rows[at]
+	local n = k.name
+	local index = if row.kind == "rule" then row.index else nil
+	-- A rule row moves before navigation reads K and J as k and j.
+	if index and (n == "K" or (n == "k" and k.shift)) then
+		return panel_move_rule(state, index, true, at)
+	elseif index and (n == "J" or (n == "j" and k.shift)) then
+		return panel_move_rule(state, index, false, at)
+	end
+	local delta = nav_delta(k)
+	if delta then
+		local i = moved(at, delta, #rows)
+		if i == at then
+			return false
+		end
+		state.panel_at = i
+		return true
+	elseif n == "escape" or n == "f" then
+		state.panel = false
+		if state.adding then
+			close_field(state, cx)
+		end
+		return true
+	elseif n == "space" or n == "x" then
+		return panel_toggle(row, n)
+	elseif n == "a" then
+		open_field(state, cx, "rule", panel_prefill(row), nil)
+		return true
+	elseif n == "d" and index then
+		return panel_delete_rule(state, index)
+	end
+	return false
 end
 
 -- Actions --------------------------------------------------------------------------------------------
@@ -450,6 +935,22 @@ local function follow_starter(state: State, cx: BlockCx, i: number)
 	end)
 end
 
+-- Opens `link` for reading through the window's route: the native reader block (blocks/reader.luau)
+-- fetches the page itself and draws its text and images, and hands the page to Tern's browser when
+-- it can't read it. The window keeps one article pane per RSS pane, so a second article lands in
+-- the same reading pane. This block, not the window, is the source of truth for the click: it
+-- records it in the file the reader beside this pane polls (lib/target.luau) before it opens the
+-- link, and the link names the mode (this host's `reader` setting) and the click's number, so the
+-- window needs neither this host's files nor its settings.
+local function open_article(cx: BlockCx, raw: string)
+	-- Feeds do write `HTTPS://…`; the route and the reader only take a lower-case scheme.
+	local link = string.gsub(raw, "^(%a+):", function(scheme: string): string
+		return string.lower(scheme) .. ":"
+	end)
+	local seq = if string.find(link, "^https?://") then target_file.write(cx.pane, link) else 0
+	cx:open(`tern-rss://read/{cx.pane}?url={url.encode(link)}&seq={seq}&mode={config.reader_mode()}`)
+end
+
 local function visit(cx: BlockCx, item: store.Item)
 	local link = item.link
 	if link == nil then
@@ -457,11 +958,36 @@ local function visit(cx: BlockCx, item: store.Item)
 		return
 	end
 	store.set_read(item.key, true)
-	cx:open("tern-rss://read/" .. cx.pane .. "?url=" .. url.encode(link))
+	open_article(cx, link)
 end
 
 local function toggle_read(item: store.Item)
 	store.set_read(item.key, not store.is_read(item.key))
+end
+
+-- Marks every post the tab shows read, or unread when they all already are, in one write. This is
+-- what follows a read filter: narrow Latest to unread, then clear the list with one key.
+local function toggle_all_read(state: State, cx: BlockCx): boolean
+	local latest = if state.tab == "latest" then snapshot(state) else UNFILTERED
+	if latest.pending > 0 then
+		-- Marking what has been judged so far would leave the rest unmarked without saying so.
+		cx:toast("info", "Still filtering the list", "Try again in a moment")
+		return true
+	end
+	local rows = shown_items(state.tab, latest)
+	if #rows == 0 then
+		return false
+	end
+	local keys: { string } = {}
+	local all_read = true
+	for _, it in rows do
+		table.insert(keys, it.key)
+		if not store.is_read(it.key) then
+			all_read = false
+		end
+	end
+	store.set_read_many(keys, not all_read)
+	return true
 end
 
 -- First call arms, second removes; the selection moves to the next feed, else the previous one.
@@ -470,7 +996,7 @@ local function remove_feed(state: State, id: string)
 		state.confirm = id
 		return
 	end
-	local feeds = store.feeds()
+	local _, feeds = drawn_feeds()
 	local next_id: string? = nil
 	for i, f in feeds do
 		if f.id == id then
@@ -514,6 +1040,29 @@ local function utf16_len(s: string): number
 	return n
 end
 
+-- The field's prompt glyph and placeholder, per intent.
+local function field_prompt(f: Field): Span
+	if f.intent == "folder" then
+		return span("# ", "accent")
+	elseif f.intent == "rule" then
+		return span("- ", "accent")
+	elseif f.intent == "feed" then
+		return span("~ ", "accent")
+	end
+	return span("+ ", "accent")
+end
+
+local function field_placeholder(f: Field): string
+	if f.intent == "folder" then
+		return "Group name, then Enter (an empty line leaves the group)"
+	elseif f.intent == "rule" then
+		return "/sponsor/ or @group /sponsor/i — hides matching posts"
+	elseif f.intent == "feed" then
+		return "Title and URL, then Enter (leave one out to keep it)"
+	end
+	return "Paste a site or feed URL, then press Enter"
+end
+
 local function add_nodes(state: State, f: Field): { Node }
 	local prefix = string.sub(f.text, 1, f.cursor)
 	local nodes: { Node } = {
@@ -521,12 +1070,12 @@ local function add_nodes(state: State, f: Field): { Node }
 			key = "add",
 			text = f.text,
 			cursor = if utf8.len(prefix) then utf16_len(prefix) else f.cursor,
-			placeholder = "Paste a site or feed URL, then press Enter",
-			prompt = { span("+ ", "accent") },
+			placeholder = field_placeholder(f),
+			prompt = { field_prompt(f) },
 		}),
 	}
 	if state.add_busy == f then
-		table.insert(nodes, ui.node("spinner", { key = "add-busy", style = "dots", label = "Looking for a feed…" }))
+		table.insert(nodes, ui.node("spinner", { key = "add-busy", style = "dots", label = if f.intent == "feed" then "Checking that feed…" else "Looking for a feed…" }))
 	elseif state.add_error then
 		table.insert(nodes, cards.with(ui.text({ span(state.add_error, "error") }), { key = "add-error" }))
 	end
@@ -659,8 +1208,26 @@ local function caught_up_at(tab: Tab): number?
 	return best
 end
 
-local function headlines_view(state: State, cx: BlockCx, parts: { Node })
-	local rows, hidden, n_new = headlines(state.tab)
+local function headlines_view(state: State, cx: BlockCx, parts: { Node }, latest: Latest)
+	local rows, hidden, n_new = headlines(state, state.tab, latest)
+	-- The filter's state sits above the list, so a post it hides is never a surprise.
+	if state.tab == "latest" then
+		local cfg = store.filter()
+		local spans: { Span | string } = {
+			span("Filter ", "muted"),
+			span(describe_filter(cfg), if filter.active(cfg) then "accent" else "muted"),
+		}
+		if latest.hidden > 0 then
+			table.insert(spans, span(" · " .. plural(latest.hidden, "post", "posts") .. " hidden", "muted"))
+		end
+		if latest.pending > 0 then
+			table.insert(spans, span(" · filtering " .. plural(latest.pending, "more post", "more posts"), "muted"))
+		end
+		table.insert(spans, span("   "))
+		table.insert(spans, span("f", "key"))
+		table.insert(spans, span(" edit", "muted"))
+		table.insert(parts, cards.with(ui.text(spans), { key = "filter-bar", actions = { click = "filter-open" } }))
+	end
 	if #rows == 0 then
 		if state.tab == "favorites" and not any_favorite() then
 			table.insert(parts, cards.with(ui.text({ span("No favorites yet.", "strong") }), { key = "empty" }))
@@ -669,6 +1236,22 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node })
 				cards.with(ui.text({ span("Star a feed in Feeds (s) and its new posts will toast you.", "muted") }), {
 					key = "empty-hint",
 				})
+			)
+		elseif state.tab == "latest" and latest.pending > 0 then
+			table.insert(parts, ui.node("spinner", { key = "empty", style = "dots", label = "Filtering your posts…" }))
+		elseif state.tab == "latest" and latest.hidden > 0 then
+			-- Not "no headlines": there are posts, and the filter (unread only, by default) is
+			-- what keeps them off the list.
+			table.insert(
+				parts,
+				cards.with(
+					ui.text({
+						span(plural(latest.hidden, "post", "posts") .. " hidden by the filter. Press ", "muted"),
+						span("f", "key"),
+						span(" to edit it.", "muted"),
+					}),
+					{ key = "empty" }
+				)
 			)
 		elseif store.busy() > 0 then
 			table.insert(parts, ui.node("spinner", { key = "empty", style = "dots", label = "Fetching your feeds…" }))
@@ -684,14 +1267,20 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node })
 	if sel and sel.key ~= sel_key(state) then
 		set_sel(state, sel.key)
 	end
+	-- The list scrolls itself: `max = { lines }` caps its height and keeps the selection in view, so
+	-- every row is drawn and the list owns the window. `bars` is what surrounds it (tab strip, filter
+	-- line, the tab's own note, the dock), plus two lines of daylight so the dock clears the edge.
+	local bars = 8 + (if state.tab == "latest" then 1 else 0) + (if state.preview then 8 else 0)
+	local cap = math.max(4, rows_fitting(cx.rows - bars, 4))
 	local now = os.time()
 	-- The divider sits where the user last caught up: under the new posts, or on top when none are new.
 	local caught = caught_up_at(state.tab)
-	local divider_before = if caught and n_new < #rows then n_new + 1 else nil
+	local divider_before = if caught then n_new + 1 else nil
 	-- Narrow panes squeeze the feed name to "…" fragments: drop it there and mark favorites in the label.
 	local narrow = cx.cols < 90
 	local children: { Node } = {}
-	for i, it in rows do
+	for i = 1, #rows do
+		local it = rows[i]
 		if i == divider_before and caught then
 			table.insert(children, cards.with(ui.rule("caught up " .. fmt.ago(caught, now)), { key = "caught-up" }))
 		end
@@ -728,14 +1317,185 @@ local function headlines_view(state: State, cx: BlockCx, parts: { Node })
 		ui.node("list", {
 			key = "items",
 			selected = if sel then "main.items." .. sel.key else nil,
-			max = { lines = rows_fitting(cx.rows - 8, 6) },
+			-- The list caps its own height and scrolls, keeping the selection in view.
+			max = { lines = cap },
 		}, children)
 	)
+	-- Posts past the row cap: the list scrolls the drawn rows itself, so only this note is left.
 	if hidden > 0 then
-		table.insert(parts, cards.with(ui.text({ span("… " .. plural(hidden, "older headline", "older headlines"), "muted") }), {
-			key = "more",
-		}))
+		table.insert(
+			parts,
+			cards.with(ui.text({ span("↓ " .. plural(hidden, "headline", "headlines") .. " not shown", "muted") }), { key = "more" })
+		)
 	end
+end
+
+-- The Latest tab's filter editor: the read gate, the group gate, then the ordered rules. Rows
+-- come from panel_rows, so the cursor and the view never disagree about which row is under it.
+local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: Latest)
+	local cfg = store.filter()
+	local rows = panel_rows()
+	local at = math.clamp(state.panel_at, 1, #rows)
+	table.insert(
+		parts,
+		cards.with(
+			ui.text({
+				span("Filter ", "strong"),
+				span("Latest", "accent"),
+				span("   "),
+				span("esc", "key"),
+				span(" close", "muted"),
+			}),
+			{ key = "filter-head" }
+		)
+	)
+	local children: { Node } = {}
+	for _, row in rows do
+		if row.kind == "read" then
+			table.insert(
+				children,
+				ui.node("item", {
+					key = row.key,
+					label = {
+						span(if cfg.read == "all" then "☑" else "☐", if cfg.read == "all" then "accent" else "muted"),
+						span(" "),
+						span("Every post", "strong"),
+					},
+					detail = if cfg.read == "all" then "space shows unread only" else cfg.read .. " only",
+					value = { span("space · x", "muted") },
+				})
+			)
+		elseif row.kind == "all" then
+			table.insert(
+				children,
+				ui.node("item", {
+					key = row.key,
+					label = {
+						span(if next(cfg.groups) == nil then "☑" else "☐", "accent"),
+						span(" "),
+						span("Every group", "strong"),
+					},
+					detail = "space unchecks every group",
+					value = { span(plural(#store.folders(), "group", "groups"), "num") },
+				})
+			)
+		elseif row.kind == "group" then
+			local name = row.name :: string
+			local feeds = store.feeds_in(name)
+			local marks: { Span | string } = {
+				span(if cfg.groups[name] then "☑" else "☐", if cfg.groups[name] then "accent" else "muted"),
+				span(" "),
+				span(if name == filter.UNGROUPED then "Ungrouped" else name, "strong"),
+			}
+			if cfg.excluded[name] then
+				table.insert(marks, span("  ⊘ excluded", "warning"))
+			end
+			table.insert(
+				children,
+				ui.node("item", {
+					key = row.key,
+					label = marks,
+					detail = plural(#feeds, "feed", "feeds"),
+					value = { span("space · x", "muted") },
+				})
+			)
+		else
+			local index = row.index :: number
+			local rule = cfg.rules[index]
+			if rule and rule.broken then
+				-- Kept in its place and written back as it was; it does nothing until fixed or deleted.
+				table.insert(
+					children,
+					ui.node("item", {
+						key = row.key,
+						label = { span(tostring(index) .. " ", "num"), span("⚠ " .. rule.raw, "warning") },
+						detail = "not applied: " .. rule.broken,
+						value = { span("K/J · d", "muted") },
+					})
+				)
+			elseif rule then
+				local where = if rule.scope.kind == "all" then "every feed" else filter.scope_text(rule.scope)
+				table.insert(
+					children,
+					ui.node("item", {
+						key = row.key,
+						label = {
+							span(tostring(index) .. " ", "num"),
+							span(if rule.drop then "" else "keep ", if rule.drop then "muted" else "accent"),
+							span(`/{rule.pat}/{rule.flags}`, if rule.drop then "error" else "accent"),
+						},
+						detail = if rule.slow then where .. " · skipped: too slow on a post" else where,
+						value = { span("K/J · d", "muted") },
+					})
+				)
+			end
+		end
+	end
+	table.insert(
+		parts,
+		ui.node("list", {
+			key = "filter",
+			selected = "main.filter." .. rows[at].key,
+			max = { lines = rows_fitting(cx.rows - 12, 4) },
+		}, children)
+	)
+	if state.adding and state.adding.intent == "rule" then
+		append(parts, add_nodes(state, state.adding))
+	end
+	local hint: { Span | string } = {
+		span("space", "key"),
+		span(" check a group   ", "muted"),
+		span("x", "key"),
+		span(" exclude   ", "muted"),
+		span("a", "key"),
+		span(" add rule   ", "muted"),
+		span("d", "key"),
+		span(" delete   ", "muted"),
+		span("K/J", "key"),
+		span(" move", "muted"),
+	}
+	table.insert(parts, cards.with(ui.text(hint), { key = "filter-keys" }))
+	table.insert(
+		parts,
+		cards.with(
+			ui.text({
+				span("Rules are read in order and the first match decides: ", "muted"),
+				span("/pattern/", "error"),
+				span(" hides, ", "muted"),
+				span("keep", "accent"),
+				span(" shows. Flags follow the closing slash: ", "muted"),
+				span("i", "code"),
+				span(" caseless, ", "muted"),
+				span("m", "code"),
+				span(" multiline, ", "muted"),
+				span("s", "code"),
+				span(" dotall, ", "muted"),
+				span("x", "code"),
+				span(" spaced.", "muted"),
+			}),
+			{ key = "filter-help" }
+		)
+	)
+	if latest.hidden > 0 then
+		table.insert(
+			parts,
+			cards.with(ui.text({ span(plural(latest.hidden, "post", "posts") .. " hidden right now", "muted") }), { key = "filter-hid" })
+		)
+	end
+end
+
+-- A group header row in the Feeds list: not selectable, so selection stays on feed ids.
+local function group_head(name: string, count: number): Node
+	return ui.node("item", {
+		key = "head:" .. name,
+		label = {
+			span("▾ ", "muted"),
+			span(if name == filter.UNGROUPED then "Ungrouped" else name, "strong"),
+		},
+		detail = plural(count, "feed", "feeds"),
+		tone = "pending",
+		disabled = true,
+	})
 end
 
 local function feeds_view(state: State, cx: BlockCx, parts: { Node }, per: { [string]: number })
@@ -750,39 +1510,44 @@ local function feeds_view(state: State, cx: BlockCx, parts: { Node }, per: { [st
 		)
 	end
 
-	local feeds = store.feeds()
+	local drawn, feeds, headers = drawn_feeds()
 	local sel = selected_feed(state, feeds)
 	local rows: { Node } = {}
-	for _, f in feeds do
-		local st = store.status(f.id)
-		local fresh = per[f.id] or 0
-		local value: Spans
-		local tone: string? = nil
-		if state.confirm == f.id then
-			value, tone = { span("remove?", "warning") }, "warning"
-		elseif st.state == "loading" then
-			value = { span("checking…", "muted") }
-		elseif st.state == "error" then
-			value, tone = { span("can't refresh", "error") }, "error"
-		elseif fresh > 0 then
-			value = { span(fresh .. " new", "num") }
-		else
-			value = { span("caught up", "muted") }
+	for _, entry in drawn do
+		local f = entry.feed
+		if f == nil and entry.name ~= nil then
+			table.insert(rows, group_head(entry.name, #store.feeds_in(entry.name)))
+		elseif f ~= nil then
+			local st = store.status(f.id)
+			local fresh = per[f.id] or 0
+			local value: Spans
+			local tone: string? = nil
+			if state.confirm == f.id then
+				value, tone = { span("remove?", "warning") }, "warning"
+			elseif st.state == "loading" then
+				value = { span("checking…", "muted") }
+			elseif st.state == "error" then
+				value, tone = { span("can't refresh", "error") }, "error"
+			elseif fresh > 0 then
+				value = { span(fresh .. " new", "num") }
+			else
+				value = { span("caught up", "muted") }
+			end
+			table.insert(
+				rows,
+				ui.node("item", {
+					key = f.id,
+					label = {
+						span(if f.favorite then "★" else "☆", if f.favorite then "accent" else "muted"),
+						span(" "),
+						span(f.title, "strong"),
+					},
+					detail = url.host(f.url),
+					value = value,
+					tone = tone,
+				})
+			)
 		end
-		table.insert(
-			rows,
-			ui.node("item", {
-				key = f.id,
-				label = {
-					span(if f.favorite then "★" else "☆", if f.favorite then "accent" else "muted"),
-					span(" "),
-					span(f.title, "strong"),
-				},
-				detail = url.host(f.url),
-				value = value,
-				tone = tone,
-			})
-		)
 	end
 	-- Sites Carly is still searching: shown under the feeds, not selectable.
 	for _, s in store.searches() do
@@ -803,7 +1568,8 @@ local function feeds_view(state: State, cx: BlockCx, parts: { Node }, per: { [st
 		ui.node("list", {
 			key = "feeds",
 			selected = if sel then "main.feeds." .. sel.id else nil,
-			max = { lines = rows_fitting(cx.rows - 12, 4) },
+			-- A group header takes a row too, so the budget shrinks by the headers drawn.
+			max = { lines = rows_fitting(cx.rows - 12 - headers, 4) },
 		}, rows)
 	)
 
@@ -850,31 +1616,64 @@ end
 
 -- Dock widths: below 70 columns labels shorten, below 56 (a pane beside the reader) only the three
 -- essential keys show, so the bar never wraps.
-local function hints_text(state: State, cx: BlockCx, has_feeds: boolean): Node
+-- Cells a hint pair needs, its separator included. A keycap chip renders no wider than its text, so
+-- text length is a safe upper bound and the measured bar stays a little narrower than reality.
+local function pair_width(pair: { string }, gap: number, first: boolean): number
+	local w = #pair[1]
+	if pair[2] ~= "" then
+		w += 1 + #pair[2]
+	end
+	return w + (if first then 0 else gap)
+end
+
+-- The longest prefix of `pairs` that fits in `cols`: the bar drops its least useful keys instead of
+-- wrapping under the pane.
+local function fit_pairs(pairs: { { string } }, cols: number, gap: number): { { string } }
+	local kept: { { string } } = {}
+	local used = 0
+	for i, pair in pairs do
+		local w = pair_width(pair, gap, i == 1)
+		if used + w > cols then
+			break
+		end
+		used += w
+		table.insert(kept, pair)
+	end
+	return kept
+end
+
+-- Dock hints, most useful key first, trimmed to the room the refresh status leaves. Below 70 columns
+-- the labels shorten and the separators tighten.
+local function hints_text(state: State, cx: BlockCx, has_feeds: boolean, reserve: number): Node
 	local narrow = cx.cols < 70
-	local tiny = cx.cols < 56
 	local catch: { string } = if state.undo then { "u", "undo" } else { "shift+m", "catch up" }
+	-- Last on the tabs that have it, so it is the first hint to go when the bar is tight.
+	local reader: { string } = { "b", if config.reader_mode() == "browser" then "browser" else "reader" }
 	local pairs: { { string } }
 	if not has_feeds then
-		pairs = { { "enter", "follow" }, { "j", "" }, { "k", "move" }, { "a", "add" } }
+		pairs = { { "enter", "follow" }, { "a", "add" }, { "j", "move" } }
+	elseif state.panel and state.tab == "latest" then
+		pairs = { { "space", "check" }, { "x", "exclude" }, { "a", "rule" }, { "K/J", "move" }, { "f", "close" } }
 	elseif state.tab == "feeds" then
-		pairs = if tiny
-			then { { "s", "star" }, catch, { "d", "remove" } }
-			else { { "s", "star" }, catch, { "d", "remove" }, { "a", "add" }, { "r", "refresh" } }
-		if narrow and not tiny then
-			table.remove(pairs, 4)
-		end
-	elseif tiny then
-		pairs = { { "enter", "open" }, { "space", "peek" }, catch }
+		pairs = { { "s", "star" }, { "t", "group" }, { "e", "edit" }, { "d", "remove" }, catch, { "a", "add" }, { "r", "refresh" }, reader }
 	else
-		pairs = { { "enter", "open" }, { "space", if narrow then "peek" else "preview" }, { "m", "read" }, catch, { "a", "add" }, { "r", "refresh" } }
-		if narrow then
-			table.remove(pairs, 5)
-		end
+		pairs = {
+			{ "enter", "open" },
+			{ "space", if narrow then "peek" else "preview" },
+			{ "f", "filter" },
+			catch,
+			{ "m", "read" },
+			{ "R", "read all" },
+			{ "a", "add" },
+			{ "r", "refresh" },
+			reader,
+		}
 	end
+	local gap = if narrow then 2 else 3
+	local kept = fit_pairs(pairs, math.max(0, cx.cols - reserve), gap)
 	local spans: { Span | string } = {}
-	for i, pair in pairs do
-		if i > 1 and pairs[i - 1][2] ~= "" then
+	for i, pair in kept do
+		if i > 1 then
 			table.insert(spans, span(if narrow then "  " else "   "))
 		end
 		table.insert(spans, span(pair[1], "key"))
@@ -887,9 +1686,31 @@ end
 
 -- The bar: key hints on the stable left edge, then refresh status and failures after a separator.
 local function dock_view(state: State, cx: BlockCx, has_feeds: boolean): Node
-	local items: { Node } = { hints_text(state, cx, has_feeds) }
+	-- What the right-hand status costs, separator included, so the hints get the rest of the line.
 	local status: { Node } = {}
+	local reserve = 0
 	local busy = store.busy()
+	if busy > 0 then
+		reserve = 3 + #("Checking " .. plural(busy, "feed", "feeds"))
+	else
+		local checked = store.checked()
+		-- A pane beside the reader has no room for it; the refresh state shows on the Feeds tab too.
+		if checked and cx.cols >= 56 then
+			local now = os.time()
+			local ago = if cx.cols < 70 then fmt.age(checked, now) else fmt.ago(checked, now)
+			reserve = 3 + #("Updated " .. ago)
+		end
+	end
+	local failing = 0
+	for _, f in store.feeds() do
+		if store.status(f.id).state == "error" then
+			failing += 1
+		end
+	end
+	if failing > 0 then
+		reserve += 3 + #(plural(failing, "feed", "feeds") .. " failing")
+	end
+	local items: { Node } = { hints_text(state, cx, has_feeds, reserve) }
 	if busy > 0 then
 		table.insert(
 			status,
@@ -902,12 +1723,6 @@ local function dock_view(state: State, cx: BlockCx, has_feeds: boolean): Node
 			local now = os.time()
 			local ago = if cx.cols < 70 then fmt.age(checked, now) else fmt.ago(checked, now)
 			table.insert(status, cards.with(ui.text({ span("Updated " .. ago, "muted") }), { key = "status" }))
-		end
-	end
-	local failing = 0
-	for _, f in store.feeds() do
-		if store.status(f.id).state == "error" then
-			failing += 1
 		end
 	end
 	if failing > 0 then
@@ -923,7 +1738,9 @@ local function dock_view(state: State, cx: BlockCx, has_feeds: boolean): Node
 		table.insert(items, cards.with(ui.text({ span("·", "muted") }), { key = "sep" }))
 		append(items, status)
 	end
-	return ui.col({ cards.with(ui.row(items), { key = "bar" }) })
+	-- One blank line under the hints. The dock's box ends at the pane's own bottom edge, where the
+	-- window's inset and rounded corner clip it; the slack line keeps the keys off that edge.
+	return ui.col({ cards.with(ui.row(items), { key = "bar" }), ui.text({ span(" ") }) })
 end
 
 -- Keys -----------------------------------------------------------------------------------------------
@@ -945,7 +1762,7 @@ local function welcome_key(state: State, k: Key, cx: BlockCx): boolean
 end
 
 local function headlines_key(state: State, k: Key, cx: BlockCx): boolean
-	local rows = headlines(state.tab)
+	local rows = headlines(state, state.tab)
 	local item, index = selected_item(state, rows)
 	if item == nil then
 		return false
@@ -980,12 +1797,23 @@ local function headlines_key(state: State, k: Key, cx: BlockCx): boolean
 	return true
 end
 
-local function feeds_key(state: State, k: Key): boolean
-	local feeds = store.feeds()
+local function feeds_key(state: State, k: Key, cx: BlockCx): boolean
+	local _, feeds = drawn_feeds()
 	local feed, index = selected_feed(state, feeds)
 	local n = k.name
-	if feed and (n == "d" or n == "delete" or n == "backspace") then
+	-- `d` arms the removal and `d` again confirms. A bare backspace used to delete the feed, which is
+	-- one stray keypress away from losing a subscription while editing a field.
+	if feed and n == "d" and not k.shift then
 		remove_feed(state, feed.id)
+		return true
+	elseif feed and n == "t" and not k.shift then
+		-- `t` groups the selected feed: the field opens with its current group, empty to leave it.
+		-- Not `g`: that jumps to the top of the list.
+		open_field(state, cx, "folder", feed.folder or "", feed.id)
+		return true
+	elseif feed and n == "e" and not k.shift then
+		-- `e` edits the selected feed: its title and its URL, on one line.
+		open_field(state, cx, "feed", feed.title .. " " .. feed.url, feed.id)
 		return true
 	end
 	local had_confirm = state.confirm ~= nil
@@ -1021,6 +1849,9 @@ local rss: BlockDef<State> = {
 			},
 			sel_at = { latest = 1, favorites = 1 },
 			preview = s.preview == true,
+			judging = false,
+			panel = s.panel == true,
+			panel_at = if type(s.panel_at) == "number" then s.panel_at else 1,
 		}
 		store.attach(cx, function()
 			cx:render()
@@ -1039,7 +1870,8 @@ local rss: BlockDef<State> = {
 		if #feeds == 0 then
 			return { main = ui.col(welcome_view(state)), dock = dock_view(state, cx, false) }
 		end
-		local all, fav, per = tally()
+		local latest = judge(state, JUDGE_BUDGET)
+		local fav, per, shown = tally(latest)
 		local function tab_label(text: string, n: number): { Span | string }
 			return { text, span(tostring(n), "num") }
 		end
@@ -1048,16 +1880,18 @@ local rss: BlockDef<State> = {
 				key = "tabs",
 				active = state.tab,
 				items = {
-					{ id = "latest", label = tab_label("Latest ", all) },
+					{ id = "latest", label = tab_label("Latest ", shown) },
 					{ id = "favorites", label = tab_label("★ Favorites ", fav) },
 					{ id = "feeds", label = tab_label("Feeds ", #feeds) },
 				},
 			}),
 		}
-		if state.tab == "feeds" then
+		if state.panel and state.tab == "latest" then
+			panel_view(state, cx, parts, latest)
+		elseif state.tab == "feeds" then
 			feeds_view(state, cx, parts, per)
 		else
-			headlines_view(state, cx, parts)
+			headlines_view(state, cx, parts, latest)
 		end
 		return { main = ui.col(parts), dock = dock_view(state, cx, true) }
 	end,
@@ -1075,7 +1909,7 @@ local rss: BlockDef<State> = {
 		end
 		local n = k.name
 		-- The no-feed offer, where it's drawn (welcome view, Feeds tab).
-		if state.missed and field_shown(state) then
+		if state.missed and offer_shown(state) then
 			if n == "c" and not k.shift then
 				ask_carly(state, cx)
 				return true
@@ -1085,19 +1919,37 @@ local rss: BlockDef<State> = {
 				return true
 			end
 		end
+		-- The filter panel takes the keys while it is up on the Latest tab, except the ones that
+		-- leave it or refresh: switching tabs and `r` work from the panel too.
+		if state.panel and state.tab == "latest" then
+			local through = n == "1" or n == "2" or n == "3" or n == "tab" or (n == "r" and not k.shift)
+			if not through then
+				return panel_key(state, k, cx)
+			end
+		end
 		if n == "paste" then
 			local u = url.normalize(k.text or "")
 			if u == nil then
 				return false
 			end
-			open_field(state, cx, u)
+			open_field(state, cx, "add", u, nil)
 			submit(state, cx)
 			return true
 		elseif n == "a" then
-			open_field(state, cx)
+			open_field(state, cx, "add", nil, nil)
 			return true
-		elseif n == "r" then
+		elseif n == "f" and state.tab == "latest" then
+			state.panel = true
+			state.panel_at = math.clamp(state.panel_at, 1, #panel_rows())
+			return true
+		elseif n == "r" and not k.shift then
 			store.refresh_all()
+			return true
+		elseif n == "b" and not k.shift then
+			-- Shared by every RSS block on this host (kv); each click carries the mode to the window.
+			local to: config.ReaderMode = if config.reader_mode() == "browser" then "native" else "browser"
+			config.set_reader_mode(to)
+			cx:toast("info", if to == "browser" then "Articles open in Tern's browser" else "Articles open in the reader")
 			return true
 		end
 
@@ -1121,12 +1973,18 @@ local rss: BlockDef<State> = {
 		if k.text == "M" or (n == "m" and k.shift) then
 			state.confirm = nil
 			return catch_up(state)
+		elseif k.text == "R" or (n == "r" and k.shift) then
+			-- Headline tabs only: the Feeds list holds feeds, not posts.
+			if state.tab == "feeds" then
+				return false
+			end
+			return toggle_all_read(state, cx)
 		elseif n == "u" and not k.shift then
 			return undo_catch_up(state)
 		end
 
 		if state.tab == "feeds" then
-			return feeds_key(state, k)
+			return feeds_key(state, k, cx)
 		end
 		return headlines_key(state, k, cx)
 	end,
@@ -1144,7 +2002,7 @@ local rss: BlockDef<State> = {
 			if key == nil then
 				return
 			end
-			local current = selected_item(state, (headlines(state.tab)))
+			local current = selected_item(state, (headlines(state, state.tab)))
 			if not (current and current.key == key) then
 				set_sel(state, key)
 			end
@@ -1156,11 +2014,22 @@ local rss: BlockDef<State> = {
 			end
 		elseif ev.ev == "select" and ev.id == "main.feeds" then
 			local id = strip_prefix(ev.item, "main.feeds.")
-			if id then
+			-- Group headers are not feeds: a click on one keeps the selection where it is.
+			if id and store.feed(id) ~= nil then
 				if state.confirm ~= id then
 					state.confirm = nil
 				end
 				state.sel.feeds = id
+			end
+		elseif ev.ev == "select" and ev.id == "main.filter" then
+			local key = strip_prefix(ev.item, "main.filter.")
+			if key then
+				for i, row in panel_rows() do
+					if row.key == key then
+						state.panel_at = i
+						break
+					end
+				end
 			end
 		elseif ev.ev == "action" then
 			local act, value = ev.act, ev.value
@@ -1176,7 +2045,10 @@ local rss: BlockDef<State> = {
 			elseif act == "remove" and value then
 				remove_feed(state, value)
 			elseif act == "add" then
-				open_field(state, cx)
+				open_field(state, cx, "add", nil, nil)
+			elseif act == "filter-open" then
+				state.panel = true
+				state.panel_at = math.clamp(state.panel_at, 1, #panel_rows())
 			elseif act == "ask-carly" then
 				ask_carly(state, cx)
 			elseif act == "dismiss" then
@@ -1198,7 +2070,7 @@ local rss: BlockDef<State> = {
 	end,
 
 	save = function(state)
-		return { tab = state.tab, preview = state.preview, sel = state.sel }
+		return { tab = state.tab, preview = state.preview, sel = state.sel, panel = state.panel, panel_at = state.panel_at }
 	end,
 }
 

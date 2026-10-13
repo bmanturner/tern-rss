@@ -108,6 +108,83 @@ function fmt.clip(text: string, max: number): string
 	return string.sub(text, 1, cut - 1) .. "…"
 end
 
+-- Bytes of the blank character that starts at `i` (ASCII space, or a Unicode space or zero-width
+-- character: NBSP, U+1680, U+2000-200B, U+2028/9, U+202F, U+205F, U+3000, BOM), 0 when there is none.
+local function blank_at(s: string, i: number): number
+	local b, c, d = string.byte(s, i, i + 2)
+	if b == nil then
+		return 0
+	elseif b == 0x20 or (b >= 9 and b <= 13) then
+		return 1
+	elseif b == 0xC2 then
+		return if c == 0xA0 then 2 else 0
+	elseif b == 0xE1 then
+		return if c == 0x9A and d == 0x80 then 3 else 0
+	elseif b == 0xE2 then
+		if c == 0x80 and d ~= nil and (d <= 0x8B or d == 0xA8 or d == 0xA9 or d == 0xAF) and d >= 0x80 then
+			return 3
+		end
+		return if c == 0x81 and d == 0x9F then 3 else 0
+	elseif b == 0xE3 then
+		return if c == 0x80 and d == 0x80 then 3 else 0
+	elseif b == 0xEF then
+		return if c == 0xBB and d == 0xBF then 3 else 0
+	end
+	return 0
+end
+
+-- `text` without the blanks at both ends, Unicode spaces included (%s only knows ASCII ones). Linear.
+function fmt.trim(text: string): string
+	local first = 1
+	while true do
+		local n = blank_at(text, first)
+		if n == 0 then
+			break
+		end
+		first += n
+	end
+	local last = #text
+	while last >= first do
+		-- A blank is 1-3 bytes; test each start that would end exactly at `last`.
+		local n = 0
+		for len = 1, 3 do
+			local at = last - len + 1
+			if at >= first and blank_at(text, at) == len then
+				n = len
+				break
+			end
+		end
+		if n == 0 then
+			break
+		end
+		last -= n
+	end
+	return string.sub(text, first, last)
+end
+
+-- `text` with every blank character (ASCII or Unicode, as trim knows them) replaced by one ASCII
+-- space, so a pattern that only knows `%s` splits where the eye sees a gap. Linear.
+function fmt.normalize_blanks(text: string): string
+	local parts: { string } = {}
+	local copied = 1 -- first byte not yet copied
+	local i = 1
+	local n = #text
+	while i <= n do
+		local len = blank_at(text, i)
+		if len > 1 or (len == 1 and string.byte(text, i) ~= 0x20) then
+			table.insert(parts, string.sub(text, copied, i - 1))
+			table.insert(parts, " ")
+			copied = i + len
+		end
+		i += math.max(len, 1)
+	end
+	if copied == 1 then
+		return text
+	end
+	table.insert(parts, string.sub(text, copied))
+	return table.concat(parts)
+end
+
 -- `ms` as "8.4s", "42s", "1m 12s" or "2h 5m".
 function fmt.duration(ms: number): string
 	if ms < 10000 then

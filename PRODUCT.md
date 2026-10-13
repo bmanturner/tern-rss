@@ -14,11 +14,11 @@ Public Tern users: developers who live in the Tern terminal and want to follow R
 
 ## Product Purpose
 
-Follow RSS/Atom feeds in a native Tern block. Headlines come first, previews open on demand, articles open in Tern's own browser block, and favorite feeds announce new posts with a toast. Success: a user subscribes in seconds, scans what is new at a glance, and never loses their place.
+Follow RSS/Atom feeds in a native Tern block. Headlines come first, previews open on demand, articles are read in a native reader block that draws text and images in place, and favorite feeds announce new posts with a toast. Success: a user subscribes in seconds, scans what is new at a glance, and never loses their place.
 
 ## Positioning
 
-Lives inside Tern as a block. Reading happens in one Tern browser block docked beside the list and reused for every article, so the list stays put while you read.
+Lives inside Tern as a block. Reading happens in one article pane docked beside the list and reused for every article: the native reader block by default (text and images drawn in document order), or Tern's browser when the reader setting says so (`b` flips it). A page the reader cannot read opens in Tern's browser in its place, so the list stays put while you read.
 
 ## Operating Context
 
@@ -31,7 +31,11 @@ Lives inside Tern as a block. Reading happens in one Tern browser block docked b
 - RSS 2.0, RSS 1.0 and Atom feeds. A pasted site is searched for its feed (feed links, platform URLs, usual paths); when that fails, the block offers to ask Carly, and Carly is asked only if the user chooses to (a toast reports the result). Starter feeds never go to Carly.
 - Not an inbox: counts mean "new since you last caught up" (`shift+m`, undoable), never a growing unread backlog; the pane title counts only new posts from favorite feeds.
 - Favorite and Carly toasts only fire while an RSS block is open somewhere in the session.
-- Data (feeds, catch-up times, read state, caches, Carly hand-off files) lives in the plugin data directory.
+- Subscription groups: one group name per feed, set with `t` on Feeds (an empty line leaves it, a new name makes a new group). Grouped feeds sit under a header row, and a group goes when its last feed does: groups are read from the feeds, not stored on their own.
+- The Latest filter (`f`): a read-state gate (starting at unread only), then a group whitelist with exclusions (an excluded group always loses), then ordered `drop` / `keep` rules written as everyday regular expressions (`/sponsor/i`, `@frontend drop /ads/`) and matched against a post's title and preview, first match wins. It scopes Latest only, so Favorites stays every favorite as is, and catch-up on Latest covers the feeds the group gate keeps. A pattern that can't finish quickly is refused when it is added, so no rule can stall the block.
+- Read state is per post (`m`, or `shift+r` for every post the tab shows) and never a backlog: it exists to filter and to dim, and the counts stay "new since you last caught up".
+- Luau has no regular expressions and Tern has no dependency manager, so the engine is vendored in the package (MIT, Roblox's luau-regexp). It is in-process Luau: the plugin still runs no programs.
+- Data (feeds and their groups, the Latest filter, catch-up times, read state, caches, Carly hand-off files) lives in the plugin data directory.
 - No accounts or sync.
 
 ## Brand Commitments

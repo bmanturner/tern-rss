@@ -10,3 +10,8 @@ window = "window.luau"
 [[blocks]]
 id = "rss"
 title = "RSS"
+
+[[blocks]]
+id = "reader"
+title = "RSS Reader"
+palette = false
