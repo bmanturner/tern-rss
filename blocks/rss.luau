@@ -46,6 +46,8 @@ type State = {
 	panel_at: number,
 	-- A timer is already set to finish judging the posts the filter has not reached (see judge).
 	judging: boolean,
+	-- What the last render's judging came to, for the keys and clicks that follow it (see snapshot).
+	latest: Latest?,
 	-- The field whose add request is in flight; a closed field's request reports by toast.
 	add_busy: Field?,
 	add_error: string?,
@@ -118,16 +120,23 @@ end
 -- counts those it hides, and `pending` those it has not reached yet (they are neither).
 type Latest = { active: boolean, shown: { [string]: boolean }, hidden: number, pending: number }
 
--- The most one host call spends matching, a share of the 2 s the host allows a handler. A single
--- capped pattern test can run past it by about 60 ms, so a call stays under 250 ms.
+-- The most one host call spends starting new pattern tests, a share of the 2 s the host allows a
+-- handler. The budget is checked before each test, so a call can run one test past it, and a test is
+-- cut off at the engine's step limit: measured on an 840-character text, 0.16 s with the JIT and
+-- 0.21 s without (`(?=(?:.?){900})x`; review saw up to 0.24 s and 0.31 s). A call is therefore the
+-- budget plus one such test plus the lookups, about 0.35 s at worst, and a pass that finds the
+-- budget gone starts no test.
 local JUDGE_BUDGET = 0.1
 
 -- Judges every post once for the Latest tab. filter.visible remembers what each pattern said about a
 -- post, so only posts that are new or changed cost anything here; the rest is a lookup. When the
 -- budget runs out before every post is judged, a timer renders again and the next call carries on.
-local function judge(state: State): Latest
+-- `budget` is the seconds to spend on new tests, for the whole call: a handler passes 0 and gets
+-- lookups only. The result is kept in `state.latest`.
+local function judge(state: State, budget: number): Latest
 	local cfg = store.filter()
 	local latest: Latest = { active = filter.active(cfg), shown = {}, hidden = 0, pending = 0 }
+	state.latest = latest
 	if not latest.active then
 		return latest
 	end
@@ -135,13 +144,16 @@ local function judge(state: State): Latest
 	for _, f in store.feeds() do
 		feeds[f.id] = f
 	end
+	local items = store.items()
 	-- A rule that gives up on a post is skipped from then on, so the posts judged before that were
-	-- judged with a rule the rest are not: the pass runs again, which is all lookups.
-	for _ = 1, 2 do
-		local slow = filter.slow_count(cfg)
+	-- judged with a rule the rest are not: the pass runs again (all lookups, and the one budget is
+	-- already spent) until a whole pass ran with the rules it ended with. Every extra pass skips one
+	-- more rule, so there are at most as many as rules, plus the last.
+	filter.budget(budget)
+	for _ = 1, #cfg.rules + 1 do
+		local skipped = filter.skipped_count(cfg)
 		latest.shown, latest.hidden, latest.pending = {}, 0, 0
-		filter.budget(JUDGE_BUDGET)
-		for _, it in store.items() do
+		for _, it in items do
 			local shown = filter.visible(cfg, it, feeds[it.feed], store.is_read(it.key))
 			if shown == nil then
 				latest.pending += 1
@@ -151,11 +163,12 @@ local function judge(state: State): Latest
 				latest.hidden += 1
 			end
 		end
-		filter.budget(nil)
-		if filter.slow_count(cfg) == slow then
+		if filter.skipped_count(cfg) == skipped then
 			break
 		end
 	end
+	filter.budget(nil)
+	filter.sweep(cfg, items, latest.pending == 0)
 	if latest.pending > 0 and not state.judging then
 		state.judging = true
 		-- 50 ms between slices, so keys and other blocks get the host between them.
@@ -167,6 +180,13 @@ local function judge(state: State): Latest
 		end)
 	end
 	return latest
+end
+
+-- The Latest snapshot the last render drew, for key and click handlers: they act on what the user
+-- sees, and judging again here would spend a second budget before view spends its own. A handler
+-- that runs before any render looks up what is already judged and tests nothing.
+local function snapshot(state: State): Latest
+	return state.latest or judge(state, 0)
 end
 
 -- For the tabs the filter does not scope.
@@ -199,9 +219,9 @@ local function shown_items(tab: Tab, latest: Latest): ({ store.Item }, number)
 end
 
 -- The headlines a tab draws, at most MAX_ROWS. Also returns how many were left out and how many rows
--- are new. `latest` is the snapshot when the caller already took one.
+-- are new. `latest` is the snapshot when the caller already took one; otherwise the last render's.
 local function headlines(state: State, tab: Tab, latest: Latest?): ({ store.Item }, number, number)
-	local all, n_fresh = shown_items(tab, if tab == "latest" then latest or judge(state) else UNFILTERED)
+	local all, n_fresh = shown_items(tab, if tab == "latest" then latest or snapshot(state) else UNFILTERED)
 	local out = table.move(all, 1, math.min(#all, MAX_ROWS), 1, {})
 	return out, #all - #out, math.min(n_fresh, MAX_ROWS)
 end
@@ -818,6 +838,9 @@ end
 local function panel_key(state: State, k: Key, cx: BlockCx): boolean
 	local rows = panel_rows()
 	local at = math.clamp(state.panel_at, 1, #rows)
+	-- The stored row can be out of range (a group vanished while the panel was open); the cursor
+	-- moves from the row that is drawn, so K and J keep it on the rule they moved.
+	state.panel_at = at
 	local row = rows[at]
 	local n = k.name
 	local index = if row.kind == "rule" then row.index else nil
@@ -838,9 +861,6 @@ local function panel_key(state: State, k: Key, cx: BlockCx): boolean
 	elseif n == "escape" or n == "f" then
 		state.panel = false
 		if state.adding then
-	-- The stored row can be out of range (a group vanished while the panel was open); the cursor
-	-- moves from the row that is drawn, so K and J keep it on the rule they moved.
-	state.panel_at = at
 			close_field(state, cx)
 		end
 		return true
@@ -928,7 +948,7 @@ end
 -- Marks every post the tab shows read, or unread when they all already are, in one write. This is
 -- what follows a read filter: narrow Latest to unread, then clear the list with one key.
 local function toggle_all_read(state: State, cx: BlockCx): boolean
-	local latest = if state.tab == "latest" then judge(state) else UNFILTERED
+	local latest = if state.tab == "latest" then snapshot(state) else UNFILTERED
 	if latest.pending > 0 then
 		-- Marking what has been judged so far would leave the rest unmarked without saying so.
 		cx:toast("info", "Still filtering the list", "Try again in a moment")
@@ -1830,7 +1850,7 @@ local rss: BlockDef<State> = {
 		if #feeds == 0 then
 			return { main = ui.col(welcome_view(state)), dock = dock_view(state, cx, false) }
 		end
-		local latest = judge(state)
+		local latest = judge(state, JUDGE_BUDGET)
 		local fav, per, shown = tally(latest)
 		local function tab_label(text: string, n: number): { Span | string }
 			return { text, span(tostring(n), "num") }

@@ -605,8 +605,39 @@ function filter.budget(seconds: number?)
 	deadline = if seconds then os.clock() + seconds else math.huge
 end
 
--- Judgements one rule remembers before it starts over, so posts that left the store don't pile up.
-local MEMO_MAX = 20000
+-- Judgements one rule remembers before it starts over: a backstop, set by `filter.sweep` to twice the
+-- posts there are. A reset mid-pass would leave a list longer than the memo never warm.
+local memo_max = 20000
+-- The post list the memos were last swept against.
+local swept: any = nil
+
+-- Keeps every rule's memo to the posts that still exist. A post leaves the memo when no feed's cache
+-- holds it any more, so a long-running host does not carry judgements (and the title and preview
+-- strings each one holds) of every post it has ever seen. `items` is the store's post list, which
+-- is the same table until a post comes or goes; the sweep runs once per list, after a pass that
+-- reached every post (`complete`), because an earlier one would drop what the rest of the pass is
+-- about to look up.
+function filter.sweep(cfg: Config, items: { any }, complete: boolean)
+	memo_max = math.max(1000, 2 * #items)
+	if not complete or items == swept then
+		return
+	end
+	swept = items
+	local live: { [string]: boolean } = {}
+	for _, it in items do
+		live[it.key] = true
+	end
+	for _, r in cfg.rules do
+		if r.memo_n > 0 then
+			for key in r.memo do
+				if not live[key] then
+					r.memo[key] = nil
+					r.memo_n -= 1
+				end
+			end
+		end
+	end
+end
 
 -- Whether `r` matches `item`, or nil when the budget is spent first. The result is remembered per
 -- post for as long as its title and preview stay as they were, so a pattern runs once per change to
@@ -619,8 +650,8 @@ local function matches(r: Rule, item: { key: string, title: string, preview: str
 	if os.clock() > deadline then
 		return nil
 	end
-	-- pcall catches the engine's step-limit error, so a pattern that cannot finish is skipped from
-	-- then on. It could not catch the host's own time budget, which would disable the whole view.
+	-- pcall catches the engine's own errors, so a pattern that cannot finish is skipped from then
+	-- on. It could not catch the host's time budget, which would disable the whole view.
 	local ran, hit = pcall(function()
 		return r.rx:test(filter.text(item))
 	end)
@@ -633,20 +664,20 @@ local function matches(r: Rule, item: { key: string, title: string, preview: str
 		end
 		return false
 	end
-	if r.memo_n >= MEMO_MAX then
+	if r.memo_n >= memo_max then
 		r.memo, r.memo_n = {}, 0
 	end
 	if r.memo[item.key] == nil then
 		r.memo_n += 1
 	end
-	local result = ran and hit == true
+	local result = hit == true
 	r.memo[item.key] = { title = item.title, preview = item.preview, hit = result }
 	return result
 end
 
--- How many rules gave up on a real post. A pass that raises this mid-way judged earlier posts with a
--- rule it later skipped, so the caller runs the pass again.
-function filter.slow_count(cfg: Config): number
+-- How many rules are being skipped: gave up on a real post, or broke on one. A pass that raises this
+-- mid-way judged earlier posts with a rule it later skipped, so the caller runs the pass again.
+function filter.skipped_count(cfg: Config): number
 	local n = 0
 	for _, r in cfg.rules do
 		if r.slow or r.broken ~= nil then
