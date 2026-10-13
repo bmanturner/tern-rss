@@ -4,11 +4,11 @@
 -- Articles: an RSS block opens one with cx:open("tern-rss://read/<pane>?url=<encoded>"). The route
 -- shows it in one article pane docked right of that RSS pane: the native reader block
 -- (blocks/reader.luau), reused for later articles and reopened when the user closed it, or Tern's
--- browser when the `reader` setting (config/block/rss/reader) says "browser". A reader that can't read a page asks for the browser with
--- "tern-rss://browser/<pane>?url=<encoded>", and the browser replaces it, so an RSS pane never has
--- two article panes. The RSS pane rides in the URL because link.pane is the focused pane; any
--- program can print such a link, so the routes dock only beside a real RSS block pane and leave
--- other links to Tern's own link handling.
+-- browser when the `reader` setting (config/block/rss/reader) says "browser". A reader that can't
+-- read a page asks for the browser with "tern-rss://browser/<pane>?url=<encoded>", and the browser
+-- replaces it, so an RSS pane never has two article panes. The RSS pane rides in the URL because
+-- link.pane is the focused pane; any program can print such a link, so the routes dock only beside
+-- a real RSS block pane and leave other links to Tern's own link handling.
 -- Carly: when the user asks Carly to find a site's feed, the RSS block writes a request file and opens
 -- "tern-rss://carly/<id>"; the route asks Carly once per request, about the site in that file (never
 -- text from the link), and Carly answers through the `found` / `not_found` exports, which write the

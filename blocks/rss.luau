@@ -19,7 +19,6 @@ type Tab = "latest" | "favorites" | "feeds"
 -- What the one-line field does on Enter.
 type Intent = "add" | "folder" | "rule" | "feed"
 
--- The one-line field, and what it is for: following a feed, setting the selected feed's group, or
 -- The one-line field, and what it is for: following a feed, setting the selected feed's group,
 -- adding a filter rule, or editing a feed. `target` is the feed id for "folder" and "feed".
 type Field = {
