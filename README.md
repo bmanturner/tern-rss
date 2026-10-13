@@ -41,7 +41,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | --- | --- |
 | Latest | Headlines from every feed. Posts that arrived since you last caught up come first, with `●` and a strong title. A "caught up" line separates them from older posts. Read posts dim in place, so nothing moves under the cursor. The filter (`f`) narrows this tab. |
 | ★ Favorites | Headlines from starred feeds only. The filter doesn't apply here. |
-| Feeds | Your subscriptions with new-post counts and refresh errors, plus sites Carly is still searching. Star, catch up, group, remove and add feeds here; grouped feeds sit under a header row. |
+| Feeds | Your subscriptions with new-post counts and refresh errors, plus sites Carly is still searching. Star, catch up, group, edit, remove and add feeds here; grouped feeds sit under a header row. |
 
 ![The Favorites tab beside the docked reader, which draws an article's text and images in place](docs/reader.png)
 
@@ -52,7 +52,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `1` `2` `3`, `tab` / `shift+tab` | Switch tabs |
 | `j` `k`, arrows, `g` `G`, `page_up` `page_down` | Move |
 | `space` (`→` / `←` to show / hide) | Toggle the preview under the selected headline |
-| `enter` or `o` | Open the article beside the list (marks it read): in the native reader by default, which draws its text and images in place, or in Tern's browser. One pane reads every article; a page the reader can't read opens in the browser in its place |
+| `enter` or `o` | Open the article beside the list (marks it read): in the native reader by default, which draws its text, headings, lists, quotes, code and images in place (page furniture such as navigation, sidebars, footers and forms is left out), or in Tern's browser. One pane reads every article; a page the reader can't read opens in the browser in its place |
 | `b` | Switch where articles open: the native reader or Tern's browser (saved, shared by every RSS block) |
 | `m` | Mark one post read / unread |
 | `shift+r` | Mark the posts this tab shows read, or unread when they all already are |
@@ -65,7 +65,7 @@ On first run the block offers four starter feeds. Press `a`, or paste any site o
 | `c` | Ask Carly to find a feed after one wasn't found; `esc` dismisses |
 | `f` (Latest) | Edit the filter: read state, groups, then ordered rules |
 | `t` (Feeds) | Set the selected feed's group (`t`, since `g` jumps to the top) |
-| `e` (Feeds) | Edit the selected feed: its title and its URL, on one line (`Title https://example.com/feed`, or `Title example.com/feed`). Leave either out to keep it; a title only counts as yours when you change it. A new URL is checked like a new feed before it replaces the old one, is refused when you already follow it, and replaces the feed's posts |
+| `e` (Feeds) | Edit the selected feed: its title and its URL, on one line (`Title https://example.com/feed`, or `Title example.com/feed`). Leave either out to keep it; a title only counts as yours when you change it. A new URL must itself be a feed (no page discovery): it is fetched before it replaces the old one, is refused when you already follow it, and replaces the feed's posts. The field stays open while it is checked; a refusal shows the reason under the field and keeps what you typed, and a title typed with a refused URL is not saved either |
 
 ### Counts and catch-up
 
@@ -107,13 +107,13 @@ A rule is one line, and the common case is just a pattern:
 /sponsor/                  hide matching posts, everywhere
 @frontend /sponsor/        ... in one group only
 #Rust Weekly /ads?/i       ... in one feed only (spaces in a name are fine)
-@"News / Tech" /ads?/      quote a name that holds " /" or ends in "keep" or "drop"
+@"News / Tech" /ads?/      quote a name that holds " /", ends in "keep" or "drop", or is one of them
 @frontend keep /rust/      show a matching post again (an exception to a drop)
 ```
 
-`drop` only has to be written to be explicit; leaving it out means drop. A scope is `@group` or `#feed`, and a feed is named by its title, its URL, its id, or its host. The pattern starts at the first `/` that begins a word, so a name may hold a slash (`@News/Tech /x/`), and it runs to the last `/` on the line, so a slash inside the pattern needs no escaping.
+`drop` only has to be written to be explicit; leaving it out means drop. A scope is `@group` or `#feed`; a group is named in any letter case, and a feed by its title, its URL, its id, or its host. The pattern starts at the first `/` that begins a word, so a name may hold a slash (`@News/Tech /x/`), and it runs to the last `/` on the line, so a slash inside the pattern needs no escaping.
 
-The pattern is a real regular expression, with `i` (caseless, ASCII letters only), `m` (multiline), `s` (dotall) and `x` (spaced) flags after the closing slash. A pattern that does not compile is refused in the field, with the engine's reason. Patterns see the post's text as it is: the title, a space, then the feed's preview, so `^` is the start of the title and `$` the end of the preview when there is one.
+The pattern is a real regular expression, with `i` (caseless, ASCII letters only), `m` (multiline), `s` (dotall) and `x` (spaced) flags after the closing slash; inline flags such as `(?i)` are refused with a pointer to those. A pattern that does not compile is refused in the field, with the engine's reason. Patterns see the post's text as it is: the title, a space, then the feed's preview, so `^` is the start of the title and `$` the end of the preview when there is one.
 
 #### What to write
 
@@ -148,9 +148,10 @@ Shapes the engine cannot run, all refused under the field rather than failing qu
 
 - `\b` and `\B` raise at match time in the vendored engine, so they are rejected when the rule is parsed. Write the boundaries by hand: `/(^| )word( |$)/`.
 - A pattern has to be inside `/…/`. A bare `sponsor` is refused with "A rule needs a /pattern/".
-- A pattern that can't finish: a repeated group that can match nothing (`(a*)*b`), nested repeats that backtrack without end (`(\w+\s?)+$`), or one whose cost grows with the square of a post (`(.*)(sponsored)`). A leading `.*` is dropped before compiling, since a rule already matches anywhere, so `/.*sponsor.*/` is fine.
+- A pattern that can't finish: a repeated group that can match nothing (`(a*)*b`), or nested repeats that backtrack without end (`(\w+\s?)+$`, `(a|aa)+$`). A leading `.*`, `.+`, `(.*)` or single repeated class (`[^。]*`) is dropped before compiling, since a rule already matches anywhere, so `/.*sponsor.*/` and `/[^。]*赞助/` are fine.
+- A pattern the engine raises on even though it compiles (some repeated lookarounds and recursions), with the engine's reason.
 
-Luau ships no regular expressions, and Tern has no dependency manager, so the engine is vendored: `lib/regexp.luau` is [Roblox's luau-regexp](https://github.com/Roblox/luau-regexp) (MIT, from Blockzez), carried in the package and licensed beside it in `lib/regexp.LICENSE`. It is in-process Luau, so the plugin still runs **no programs**. The vendored copy counts its steps and gives up past a limit, so no rule can stall the block: a pattern that gives up on the samples is refused when it is added, and one that gives up on a real post is skipped from then on and marked "skipped: too slow on a post" in the panel. Matching runs once per post and rule, not on every redraw; a large store is filtered a slice at a time, and the status line says "filtering N more posts" until it is done.
+Luau ships no regular expressions, and Tern has no dependency manager, so the engine is vendored: `lib/regexp.luau` is [Roblox's luau-regexp](https://github.com/Roblox/luau-regexp) (MIT, from Blockzez), carried in the package and licensed beside it in `lib/regexp.LICENSE`. It is in-process Luau, so the plugin still runs **no programs**. The vendored copy counts its steps and gives up past a limit, so no rule can stall the block: a pattern that gives up on the samples is refused when it is added, one that gives up on a real post is skipped from then on and marked "skipped: too slow on a post" in the panel, and one the engine raises on is marked "not applied" with its reason. Matching runs once per post and rule, not on every redraw; a large store is filtered a slice at a time, and the status line says "filtering N more posts" until it is done.
 
 Rules are read in order and the first match decides: `drop` hides the post, `keep` shows it. When no rule matches, the group gate decides. `/./` hides everything, so `keep` rules above it are a whitelist. Catch-up on Latest covers the feeds the group gate keeps; posts a rule hides are caught up with their feed.
 
@@ -187,11 +188,11 @@ The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filte
 {"version":1,"read":"unread","groups":{"tech":true},"excluded":{},"rules":["#Rust Weekly keep /./","/sponsor/i"]}
 ```
 
-`read` is `all`, `unread` or `read`, `groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter starts over from its defaults (unread only, no groups, no rules). A rule line that doesn't parse stays where it is and is written back untouched: the panel shows it with a ⚠ and the reason, it does nothing until you fix it by hand, and `d` deletes it. The filter is shared by every RSS block in this host, like the feed list.
+`read` is `all`, `unread` or `read`, `groups` holds the checked groups, `excluded` the excluded ones, and `rules` the rule lines in the order they are read. A file that doesn't decode is kept as `filters.json.bad` and the filter starts over from its defaults (unread only, no groups, no rules). A rule line that doesn't parse stays where it is and is written back untouched: the panel shows it with a ⚠ and the reason, it does nothing until you fix it by hand, and `d` deletes it. Groups no feed carries any more are dropped from the file when it loads, unless `feeds.json` itself failed to load (then nothing is dropped). The filter is shared by every RSS block in this host, like the feed list.
 
 ## Privacy
 
-- **Network:** the plugin fetches the feed URLs you follow. While you add a site, it also fetches candidate feed URLs on that site's host and links the page itself points to. Candidates on loopback or private-network addresses are skipped unless the URL you pasted is itself local. Articles you open are fetched and drawn by the reader block, with the images they show; a page it cannot read opens in Tern's browser instead, and with the `browser` setting every article does.
+- **Network:** the plugin fetches the feed URLs you follow. While you add a site, it also fetches candidate feed URLs on that site's host and links the page itself points to. Candidates whose address is written as loopback or private-network (`localhost`, `127.0.0.1`, `192.168.…`) are skipped unless the URL you pasted is itself local; this checks the address as written, so a public name that resolves to, or redirects to, a private address still gets through. Articles you open are fetched and drawn by the reader block, with the images they show (images on such addresses only when the article is on one too); a page it cannot read opens in Tern's browser instead, and with the `browser` setting every article does.
 - **Carly:** asked only when you choose "Ask Carly to find it".
 - **Nothing else:** no telemetry, no accounts, no sync.
 
@@ -200,9 +201,9 @@ The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filte
 
 ### What it runs and writes
 
-- **Network:** each feed URL with `tern.fetch`, every refresh interval while an RSS block is open. Requests are conditional (`If-None-Match` / `If-Modified-Since`), at most 4 at a time, with a 20 s timeout; bodies over 4 MB are rejected. Adding a site also fetches its feed candidates, at most 4 at a time with a 10 s timeout each. The reader fetches the article page (it reads the first 1.5 MB) and up to 12 of its `http(s)` images, with `tern.fetch`'s defaults (30 s, 16 MiB).
+- **Network:** each feed URL with `tern.fetch`, every refresh interval while an RSS block is open. Requests are conditional (`If-None-Match` / `If-Modified-Since`), at most 4 at a time, with a 20 s timeout; bodies over 4 MB are rejected. Adding a site also fetches its feed candidates, at most 4 at a time with a 10 s timeout each. The reader fetches the article page (it reads the first 1.5 MB) and up to 12 of its `http(s)` images with `tern.fetch`'s defaults (30 s); an image is shown only when it is `image/*` and at most 4 MiB.
 - **Programs:** none.
-- **Writes:** in the plugin data directory, `rss/feeds.json` (each feed and its group), `rss/read.json`, `rss/filters.json`, `rss/cache/<feed>.json`, `reader-<pane>.json` while a reader pane is open (the next article it should show; removed when the pane goes) and, only after you ask Carly, `rss/carly/<id>.{request,answer,asked,result}.json`; `kv.json` only when config is set or `b` is pressed. Nothing in the package folder.
+- **Writes:** in the plugin data directory, `rss/feeds.json` (each feed and its group), `rss/read.json`, `rss/filters.json`, `rss/cache/<feed>.json`, `reader-<rss pane>.json` (the last article clicked in that RSS pane, which the reader beside it follows; a few bytes, overwritten by the next click) and, only after you ask Carly, `rss/carly/<id>.{request,answer,asked,result}.json`; `kv.json` when config is set, when `b` is pressed, and for the `articles` key (which pane beside each RSS pane is its article pane). Nothing in the package folder.
 - **Reads:** `plugin.toml`, the `blocks/` listing, and the files above.
 - **Logs:** warn lines prefixed `tern-rss`.
 
@@ -210,7 +211,7 @@ The Latest filter is edited in the block (`f` on Latest) and lives in `rss/filte
 
 - Developed and tested on Tern 0.6.1, desktop.
 - Uses Carly exports and `ask_carly` (for the optional, ask-first feed search), and Tern's browser API for the `browser` setting and for pages the native reader cannot read.
-- The plugin's host half runs where the panes run. To use the RSS block in a pane on a remote host, install the plugin on that host too, following Tern's remote-host rules.
+- The plugin's host half runs where the panes run. To use the RSS block in a pane on a remote host, install the plugin on that host too, following Tern's remote-host rules. The reader, its click file and the `b` setting live on that host with the RSS block, so articles open the same way there.
 
 ## Uninstall
 
@@ -245,8 +246,10 @@ lib/manifest.luau      reads [[blocks]] id/title/palette from plugin.toml (both 
 lib/config.luau        typed per-block config over tern.kv; the rss settings (both halves)
 lib/cards.luau         error card + props helper                       (both halves)
 lib/poll.luau          pane liveness check                             (host only: tern.pane)
-lib/fmt.luau           times, ages, counts, durations, clipping        (both halves)
-lib/url.luau           percent-encoding, URL normalize/host/resolve    (both halves)
+lib/target.luau        the RSS block's clicks, for the reader beside it (host only)
+lib/fmt.luau           times, ages, counts, durations, clipping, trim  (both halves)
+lib/url.luau           percent-encoding, URL normalize/host/resolve,
+                       private-address check                           (both halves)
 lib/feed.luau          RSS/Atom/RDF parser, feed candidates, dates,
                        article extraction for the reader               (both halves, pure)
 lib/filter.luau        the Latest filter: rules, parser, match test     (both halves, pure)
@@ -261,7 +264,7 @@ LICENSE                MIT
 
 ## Contributing
 
-Questions, bug reports and pull requests are welcome in [issues](https://github.com/bmanturner/tern-rss/issues) and [pull requests](https://github.com/bmanturner/tern-rss/pulls). Set up with the [Develop](#develop) steps. Keep every file `--!strict`, and type-check with luau-lsp against the `tern.d.luau` that `tern plugin types .` writes. `lib/regexp.luau` is the one exception: it is vendored third-party code, so leave it as it came, license and all, apart from the two patches its header lists (the flag names and the step limit).
+Questions, bug reports and pull requests are welcome in [issues](https://github.com/bmanturner/tern-rss/issues) and [pull requests](https://github.com/bmanturner/tern-rss/pulls). Set up with the [Develop](#develop) steps. Keep every file `--!strict`, and type-check every file (not just the entry files) with luau-lsp against the `tern.d.luau` that `tern plugin types .` writes, for example `luau-lsp analyze --definitions=@tern=tern.d.luau host.luau window.luau blocks/*.luau lib/*.luau`. `lib/regexp.luau` is the one exception: it is vendored third-party code, so leave it as it came, license and all, apart from the three patches its header lists (the flag names, the step limit, and the repeated empty backreference).
 
 ## License
 
