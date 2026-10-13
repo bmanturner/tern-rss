@@ -12,7 +12,7 @@
 -- The pattern is a real regular expression with flags (`i` caseless, `m` multiline, `s` dotall,
 -- `x` extended), because "Luau patterns" are a dialect nobody has learned and this file's readers
 -- have. Tern has no dependency manager, so the engine is vendored: lib/regexp.luau (MIT, Roblox's
--- luau-regexp). Patterns compile once, when the rule is parsed.
+-- luau-regexp). Patterns compile once, when the rule is parsed, and the engine stops any one search at a step limit.
 --
 -- Rules are read in order and the FIRST that matches decides the post: `drop` hides it, `keep`
 -- shows it. With no rule matching, the group gate decides. A pattern is matched against the post's
@@ -26,9 +26,23 @@ local regexp = require("./regexp")
 local filter = {}
 
 export type Scope = { kind: "all" } | { kind: "group", name: string } | { kind: "feed", key: string }
+-- What a rule remembers of one post it judged, valid while the post's title and preview stay as they
+-- were.
+export type Hit = { title: string, preview: string?, hit: boolean }
 -- A rule: the scope, the action, the pattern, its flags, and the compiled pattern. `raw` is the line
--- as typed, so the panel and filters.json show it back.
-export type Rule = { scope: Scope, drop: boolean, pat: string, flags: string, rx: any, raw: string }
+-- as typed, so the panel and filters.json show it back. `slow` is set when a real post ran the
+-- pattern out of steps (it is skipped from then on); `memo` is the posts it has judged.
+export type Rule = {
+	scope: Scope,
+	drop: boolean,
+	pat: string,
+	flags: string,
+	rx: any,
+	raw: string,
+	slow: boolean,
+	memo: { [string]: Hit },
+	memo_n: number,
+}
 -- Which posts the read state lets through.
 export type ReadState = "all" | "unread" | "read"
 export type Config = {
@@ -47,6 +61,9 @@ filter.UNGROUPED = ""
 
 -- Which flags a pattern may carry, after its closing slash.
 local FLAGS: { [string]: boolean } = { i = true, m = true, s = true, x = true }
+
+-- What lib/regexp raises when one search outruns its step limit.
+local STEP_ERROR = "step limit"
 
 -- The read states the panel steps through, in order.
 local READ_STATES: { ReadState } = { "all", "unread", "read" }
@@ -105,9 +122,24 @@ local function has_top_alternation(pat: string): boolean
 	return false
 end
 
+-- Text a pattern has to survive when the rule is added: empty, short, runs of one letter, words,
+-- spaces, and the near-miss endings that make nested quantifiers backtrack. Each test is bounded by
+-- the engine's step limit, so a pattern that cannot finish on one of these is refused here instead of
+-- being found out on a real post.
+local SAMPLES: { string } = {
+	"",
+	"b",
+	string.rep("a", 40),
+	string.rep("a", 28) .. "!",
+	string.rep("ab", 20) .. "!",
+	string.rep("a ", 20) .. "!",
+	string.rep("word ", 8) .. "!",
+	string.rep(" ", 40),
+}
+
 -- Compiles `pat` with `flags`. Returns the compiled pattern, or nil and the engine's complaint.
 --
--- Two of the vendored engine's behaviours are worked around here, both verified against it:
+-- Three of the vendored engine's behaviours are worked around here, all verified against it:
 --
 --   * Top-level alternation only ever matches at the first position, so `/ads|广告/` misses a post
 --     whose title starts with something else. Wrapping the pattern in a group fixes it, and only a
@@ -115,6 +147,9 @@ end
 --     nothing on its own, such as a lone lookahead, would change what the pattern matches.
 --   * `\b` and `\B` raise at match time rather than compile time. They are refused here, so the
 --     problem shows up under the field instead of in the middle of a list.
+--   * A quantified group that can match empty never finishes, and nested quantifiers can backtrack
+--     without end. lib/regexp counts its steps and raises past a limit; the samples above find the
+--     patterns that hit it, and the same limit marks a rule slow if a real post finds one first.
 function filter.compile(pat: string, flags: string): (any?, string?)
 	for i = 1, #flags do
 		local c = string.sub(flags, i, i)
@@ -133,6 +168,14 @@ function filter.compile(pat: string, flags: string): (any?, string?)
 		-- The engine names its own file and line; the field wants the complaint, not the path.
 		local message = string.match(tostring(rx), "^[^:]*:%d+: (.*)$") or tostring(rx)
 		return nil, `Pattern error: {message}`
+	end
+	for _, sample in SAMPLES do
+		local ran, err = pcall(function()
+			return rx:test(sample)
+		end)
+		if not ran and string.find(tostring(err), STEP_ERROR, 1, true) then
+			return nil, "That pattern can loop or backtrack without end; simplify its repeated groups"
+		end
 	end
 	return rx
 end
@@ -199,7 +242,17 @@ function filter.parse(line: string): (Rule?, string?)
 	if rx == nil then
 		return nil, err
 	end
-	return { scope = scope, drop = action == "drop", pat = pat, flags = flags, rx = rx, raw = s }
+	return {
+		scope = scope,
+		drop = action == "drop",
+		pat = pat,
+		flags = flags,
+		rx = rx,
+		raw = s,
+		slow = false,
+		memo = {},
+		memo_n = 0,
+	}
 end
 
 -- The scope written back as a line prefix: `@group`, `#feed`, or "" for every feed.
@@ -257,13 +310,61 @@ function filter.text(item: { title: string, preview: string? }): string
 	return item.title .. " " .. item.preview
 end
 
--- A compiled pattern, run defensively: a pattern slow enough to be pathological must not take the
--- block down with it.
-local function matches(r: Rule, text: string): boolean
-	local ok, hit = pcall(function()
-		return r.rx:test(text)
+-- Where a pass over the posts has to stop (an os.clock time); no limit until `filter.budget` sets one.
+local deadline = math.huge
+
+-- Limits the matching that follows to `seconds` from now, or lifts the limit with nil. Past it,
+-- `filter.visible` answers nil for a post it has not yet judged, and a later call picks up from the
+-- cache without redoing the rest. The host kills a handler that overruns its own budget, so a list
+-- too long to judge in one call has to be judged in several.
+function filter.budget(seconds: number?)
+	deadline = if seconds then os.clock() + seconds else math.huge
+end
+
+-- Judgements one rule remembers before it starts over, so posts that left the store don't pile up.
+local MEMO_MAX = 20000
+
+-- Whether `r` matches `item`, or nil when the budget is spent first. The result is remembered per
+-- post for as long as its title and preview stay as they were, so a pattern runs once per change to
+-- the post rather than once per render.
+local function matches(r: Rule, item: { key: string, title: string, preview: string? }): boolean?
+	local seen = r.memo[item.key]
+	if seen and seen.title == item.title and seen.preview == item.preview then
+		return seen.hit
+	end
+	if os.clock() > deadline then
+		return nil
+	end
+	-- pcall catches the engine's step-limit error, so a pattern that cannot finish is skipped from
+	-- then on. It could not catch the host's own time budget, which would disable the whole view.
+	local ran, hit = pcall(function()
+		return r.rx:test(filter.text(item))
 	end)
-	return ok and hit == true
+	if not ran and string.find(tostring(hit), STEP_ERROR, 1, true) then
+		r.slow = true
+		return false
+	end
+	if r.memo_n >= MEMO_MAX then
+		r.memo, r.memo_n = {}, 0
+	end
+	if r.memo[item.key] == nil then
+		r.memo_n += 1
+	end
+	local result = ran and hit == true
+	r.memo[item.key] = { title = item.title, preview = item.preview, hit = result }
+	return result
+end
+
+-- How many rules gave up on a real post. A pass that raises this mid-way judged earlier posts with a
+-- rule it later skipped, so the caller runs the pass again.
+function filter.slow_count(cfg: Config): number
+	local n = 0
+	for _, r in cfg.rules do
+		if r.slow then
+			n += 1
+		end
+	end
+	return n
 end
 
 -- Whether the group gate alone lets a post of `folder` through, ignoring the rules.
@@ -277,21 +378,26 @@ function filter.group_allows(cfg: Config, folder: string): boolean
 	return cfg.groups[folder] == true
 end
 
--- Whether a post is shown. `feed` is its feed, when the store still knows it, and `read` its read
--- state. The read gate is absolute: it decides before any rule does, so "Unread" means unread.
-function filter.visible(cfg: Config, item: { title: string, preview: string? }, feed: any, read: boolean): boolean
+-- Whether a post is shown: true or false, or nil when `filter.budget` ran out before the rules could
+-- say. `feed` is its feed, when the store still knows it, and `read` its read state. The read gate is
+-- absolute: it decides before any rule does, so "Unread" means unread.
+function filter.visible(
+	cfg: Config,
+	item: { key: string, title: string, preview: string? },
+	feed: any,
+	read: boolean
+): boolean?
 	if cfg.read == "unread" and read then
 		return false
 	elseif cfg.read == "read" and not read then
 		return false
 	end
-	local text: string? = nil
 	for _, r in cfg.rules do
-		if in_scope(r.scope, feed) then
-			if text == nil then
-				text = filter.text(item)
-			end
-			if matches(r, text) then
+		if not r.slow and in_scope(r.scope, feed) then
+			local hit = matches(r, item)
+			if hit == nil then
+				return nil
+			elseif hit then
 				return not r.drop
 			end
 		end

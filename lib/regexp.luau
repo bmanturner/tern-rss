@@ -4,9 +4,15 @@
 -- engine, adapted from Blockzez. MIT (see lib/regexp.LICENSE). Keep it byte-for-byte apart from
 -- this header: it is third-party code, so `--!nolint --!nocheck` stay on and nothing is renamed.
 --
--- Patched, and the only change: `re.new` sets `caseless` and `dotall`, while the matcher read
--- `ignoreCase` and `dotAll`, so the `i` and `s` flags did nothing at all (as of upstream
--- 2102-line HEAD). Those reads are renamed here. Nothing else is touched.
+-- Patched in two places, and nothing else is touched:
+--   1. `re.new` sets `caseless` and `dotall`, while the matcher read `ignoreCase` and `dotAll`, so
+--      the `i` and `s` flags did nothing at all (as of upstream 2102-line HEAD). Those reads are
+--      renamed here.
+--   2. `re_rawfind` counts its steps (one per token visited and one per backtrack pop) and raises
+--      "regexp: step limit" past STEP_LIMIT. Upstream has no bound: a quantified group that can match
+--      empty, such as `(a*)*b`, loops forever, and `(\w+\s?)+$` backtracks exponentially. Neither can
+--      be interrupted from outside, so a user's pattern could hang the host. The limit is the
+--      `STEP_LIMIT` local just above `re_rawfind`.
 -- Why it lives here: Luau ships no regex and Tern has no dependency manager, so a plugin that
 -- wants real patterns has to carry the engine. lib/filter.luau is the only caller.
 --[[
@@ -498,10 +504,21 @@ local function find_alternation(token, i, count)
 	end;
 end;
 
+-- Patch 2: the most steps one search may take before it gives up (see the header).
+local STEP_LIMIT = 400000;
+-- Backtrack states are inserted at the front of an array, so a runaway pattern costs quadratic time
+-- in how many it piles up; this bounds that too.
+local STATE_LIMIT = 2000;
+
 local function re_rawfind(token, str_arr, init, flags, verb_flags, as_bool)
 	local tkn_i, str_i, start_i = 0, init, init;
 	local states = { };
+	local steps = 0;
 	while tkn_i do
+		steps += 1;
+		if steps > STEP_LIMIT or #states > STATE_LIMIT then
+			error("regexp: step limit", 0);
+		end;
 		if tkn_i == 0 then
 			tkn_i += 1;
 			local next_alt = find_alternation(token, tkn_i);
@@ -719,6 +736,10 @@ local function re_rawfind(token, str_arr, init, flags, verb_flags, as_bool)
 			end;
 			if not match then
 				while true do
+					steps += 1;
+					if steps > STEP_LIMIT then
+						error("regexp: step limit", 0);
+					end;
 					local prev_type, prev_state = states[1] and states[1][1], states[1];
 					if not prev_type or prev_type == "PRUNE" or prev_type == "SKIP" then
 						if prev_type then

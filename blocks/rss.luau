@@ -45,6 +45,8 @@ type State = {
 	-- The Latest tab's filter panel: whether it is up, and the row it points at (see panel_rows).
 	panel: boolean,
 	panel_at: number,
+	-- A timer is already set to finish judging the posts the filter has not reached (see judge).
+	judging: boolean,
 	-- The field whose add request is in flight; a closed field's request reports by toast.
 	add_busy: Field?,
 	add_error: string?,
@@ -112,17 +114,78 @@ local function any_favorite(): boolean
 	return false
 end
 
--- The headlines a tab draws, at most MAX_ROWS: posts new since the last catch-up first, then the
--- rest, each group newest first. Also returns how many were left out and how many rows are new.
-local function headlines(tab: Tab): ({ store.Item }, number, number)
+-- What the Latest filter makes of the posts. Matching a pattern costs far more than a render may,
+-- so the result is a snapshot: `shown` holds the keys of the posts the filter lets through, `hidden`
+-- counts those it hides, and `pending` those it has not reached yet (they are neither).
+type Latest = { active: boolean, shown: { [string]: boolean }, hidden: number, pending: number }
+
+-- The most one host call spends matching, a share of the 2 s the host allows a handler. A single
+-- capped pattern test can run past it by about 60 ms, so a call stays under 250 ms.
+local JUDGE_BUDGET = 0.1
+
+-- Judges every post once for the Latest tab. filter.visible remembers what each pattern said about a
+-- post, so only posts that are new or changed cost anything here; the rest is a lookup. When the
+-- budget runs out before every post is judged, a timer renders again and the next call carries on.
+local function judge(state: State): Latest
+	local cfg = store.filter()
+	local latest: Latest = { active = filter.active(cfg), shown = {}, hidden = 0, pending = 0 }
+	if not latest.active then
+		return latest
+	end
+	local feeds: { [string]: store.Feed } = {}
+	for _, f in store.feeds() do
+		feeds[f.id] = f
+	end
+	-- A rule that gives up on a post is skipped from then on, so the posts judged before that were
+	-- judged with a rule the rest are not: the pass runs again, which is all lookups.
+	for _ = 1, 2 do
+		local slow = filter.slow_count(cfg)
+		latest.shown, latest.hidden, latest.pending = {}, 0, 0
+		filter.budget(JUDGE_BUDGET)
+		for _, it in store.items() do
+			local shown = filter.visible(cfg, it, feeds[it.feed], store.is_read(it.key))
+			if shown == nil then
+				latest.pending += 1
+			elseif shown then
+				latest.shown[it.key] = true
+			else
+				latest.hidden += 1
+			end
+		end
+		filter.budget(nil)
+		if filter.slow_count(cfg) == slow then
+			break
+		end
+	end
+	if latest.pending > 0 and not state.judging then
+		state.judging = true
+		-- 50 ms between slices, so keys and other blocks get the host between them.
+		tern.timer(50, function()
+			state.judging = false
+			pcall(function()
+				state.cx:render()
+			end)
+		end)
+	end
+	return latest
+end
+
+-- For the tabs the filter does not scope.
+local UNFILTERED: Latest = { active = false, shown = {}, hidden = 0, pending = 0 }
+
+local function is_shown(latest: Latest, key: string): boolean
+	return not latest.active or latest.shown[key] == true
+end
+
+-- Every post a tab shows, posts new since the last catch-up first, then the rest, each group newest
+-- first; and how many of them are new. The filter scopes the Latest tab; Favorites stays the starred
+-- feeds as they are.
+local function shown_items(tab: Tab, latest: Latest): ({ store.Item }, number)
 	local fresh: { store.Item } = {}
 	local older: { store.Item } = {}
-	-- The filter scopes the Latest tab; Favorites stays the starred feeds as they are.
-	local cfg = store.filter()
-	local filtered = tab == "latest" and filter.active(cfg)
 	for _, it in store.items() do
 		if tab ~= "favorites" or is_favorite(it) then
-			if not filtered or filter.visible(cfg, it, store.feed(it.feed), store.is_read(it.key)) then
+			if tab ~= "latest" or is_shown(latest, it.key) then
 				if store.is_new(it) then
 					table.insert(fresh, it)
 				else
@@ -131,31 +194,17 @@ local function headlines(tab: Tab): ({ store.Item }, number, number)
 			end
 		end
 	end
-	local out: { store.Item } = {}
-	for _, group in { fresh, older } do
-		for _, it in group do
-			if #out >= MAX_ROWS then
-				break
-			end
-			table.insert(out, it)
-		end
-	end
-	return out, #fresh + #older - #out, math.min(#fresh, MAX_ROWS)
+	local n_fresh = #fresh
+	table.move(older, 1, #older, n_fresh + 1, fresh)
+	return fresh, n_fresh
 end
 
--- How many posts the Latest filter hides right now (for the panel and the status line).
-local function hidden_count(): number
-	local cfg = store.filter()
-	if not filter.active(cfg) then
-		return 0
-	end
-	local n = 0
-	for _, it in store.items() do
-		if not filter.visible(cfg, it, store.feed(it.feed), store.is_read(it.key)) then
-			n += 1
-		end
-	end
-	return n
+-- The headlines a tab draws, at most MAX_ROWS. Also returns how many were left out and how many rows
+-- are new. `latest` is the snapshot when the caller already took one.
+local function headlines(state: State, tab: Tab, latest: Latest?): ({ store.Item }, number, number)
+	local all, n_fresh = shown_items(tab, if tab == "latest" then latest or judge(state) else UNFILTERED)
+	local out = table.move(all, 1, math.min(#all, MAX_ROWS), 1, {})
+	return out, #all - #out, math.min(n_fresh, MAX_ROWS)
 end
 
 local function sel_key(state: State): string?
@@ -343,18 +392,16 @@ local function panel_prefill(row: PanelRow): string
 end
 
 -- New unread posts: those from favorite feeds, per feed id, and those the Latest filter shows.
-local function tally(): (number, { [string]: number }, number)
+local function tally(latest: Latest): (number, { [string]: number }, number)
 	local fav, shown = 0, 0
 	local per: { [string]: number } = {}
-	local cfg = store.filter()
-	local filtered = filter.active(cfg)
 	for _, it in store.items() do
 		if not store.is_read(it.key) and store.is_new(it) then
 			per[it.feed] = (per[it.feed] or 0) + 1
 			if is_favorite(it) then
 				fav += 1
 			end
-			if not filtered or filter.visible(cfg, it, store.feed(it.feed), store.is_read(it.key)) then
+			if is_shown(latest, it.key) then
 				shown += 1
 			end
 		end
@@ -817,7 +864,7 @@ end
 -- Marks every post the tab shows read, or unread when they all already are, in one write. This is
 -- what follows a read filter: narrow Latest to unread, then clear the list with one key.
 local function toggle_all_read(state: State): boolean
-	local rows = headlines(state.tab)
+	local rows = headlines(state, state.tab)
 	if #rows == 0 then
 		return false
 	end
@@ -1051,18 +1098,20 @@ local function caught_up_at(tab: Tab): number?
 	return best
 end
 
-local function headlines_view(state: State, cx: BlockCx, parts: { Node })
-	local rows, hidden, n_new = headlines(state.tab)
+local function headlines_view(state: State, cx: BlockCx, parts: { Node }, latest: Latest)
+	local rows, hidden, n_new = headlines(state, state.tab, latest)
 	-- The filter's state sits above the list, so a post it hides is never a surprise.
 	if state.tab == "latest" then
 		local cfg = store.filter()
-		local hid = hidden_count()
 		local spans: { Span | string } = {
 			span("Filter ", "muted"),
 			span(describe_filter(cfg), if filter.active(cfg) then "accent" else "muted"),
 		}
-		if hid > 0 then
-			table.insert(spans, span(" · " .. plural(hid, "post", "posts") .. " hidden", "muted"))
+		if latest.hidden > 0 then
+			table.insert(spans, span(" · " .. plural(latest.hidden, "post", "posts") .. " hidden", "muted"))
+		end
+		if latest.pending > 0 then
+			table.insert(spans, span(" · filtering " .. plural(latest.pending, "more post", "more posts"), "muted"))
 		end
 		table.insert(spans, span("   "))
 		table.insert(spans, span("f", "key"))
@@ -1157,7 +1206,7 @@ end
 
 -- The Latest tab's filter editor: the read gate, the group gate, then the ordered rules. Rows
 -- come from panel_rows, so the cursor and the view never disagree about which row is under it.
-local function panel_view(state: State, cx: BlockCx, parts: { Node })
+local function panel_view(state: State, cx: BlockCx, parts: { Node }, latest: Latest)
 	local cfg = store.filter()
 	local rows = panel_rows()
 	local at = math.clamp(state.panel_at, 1, #rows)
@@ -1294,11 +1343,10 @@ local function panel_view(state: State, cx: BlockCx, parts: { Node })
 			{ key = "filter-help" }
 		)
 	)
-	local hid = hidden_count()
-	if hid > 0 then
+	if latest.hidden > 0 then
 		table.insert(
 			parts,
-			cards.with(ui.text({ span(plural(hid, "post", "posts") .. " hidden right now", "muted") }), { key = "filter-hid" })
+			cards.with(ui.text({ span(plural(latest.hidden, "post", "posts") .. " hidden right now", "muted") }), { key = "filter-hid" })
 		)
 	end
 end
@@ -1599,7 +1647,7 @@ local function welcome_key(state: State, k: Key, cx: BlockCx): boolean
 end
 
 local function headlines_key(state: State, k: Key, cx: BlockCx): boolean
-	local rows = headlines(state.tab)
+	local rows = headlines(state, state.tab)
 	local item, index = selected_item(state, rows)
 	if item == nil then
 		return false
@@ -1686,6 +1734,7 @@ local rss: BlockDef<State> = {
 			},
 			sel_at = { latest = 1, favorites = 1 },
 			preview = s.preview == true,
+			judging = false,
 			panel = s.panel == true,
 			panel_at = if type(s.panel_at) == "number" then s.panel_at else 1,
 		}
@@ -1706,7 +1755,8 @@ local rss: BlockDef<State> = {
 		if #feeds == 0 then
 			return { main = ui.col(welcome_view(state)), dock = dock_view(state, cx, false) }
 		end
-		local fav, per, shown = tally()
+		local latest = judge(state)
+		local fav, per, shown = tally(latest)
 		local function tab_label(text: string, n: number): { Span | string }
 			return { text, span(tostring(n), "num") }
 		end
@@ -1722,11 +1772,11 @@ local rss: BlockDef<State> = {
 			}),
 		}
 		if state.panel and state.tab == "latest" then
-			panel_view(state, cx, parts)
+			panel_view(state, cx, parts, latest)
 		elseif state.tab == "feeds" then
 			feeds_view(state, cx, parts, per)
 		else
-			headlines_view(state, cx, parts)
+			headlines_view(state, cx, parts, latest)
 		end
 		return { main = ui.col(parts), dock = dock_view(state, cx, true) }
 	end,
@@ -1833,7 +1883,7 @@ local rss: BlockDef<State> = {
 			if key == nil then
 				return
 			end
-			local current = selected_item(state, (headlines(state.tab)))
+			local current = selected_item(state, (headlines(state, state.tab)))
 			if not (current and current.key == key) then
 				set_sel(state, key)
 			end
