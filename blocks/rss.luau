@@ -934,7 +934,11 @@ end
 -- records it in the file the reader beside this pane polls (lib/target.luau) before it opens the
 -- link, and the link names the mode (this host's `reader` setting) and the click's number, so the
 -- window needs neither this host's files nor its settings.
-local function open_article(cx: BlockCx, link: string)
+local function open_article(cx: BlockCx, raw: string)
+	-- Feeds do write `HTTPS://…`; the route and the reader only take a lower-case scheme.
+	local link = string.gsub(raw, "^(%a+):", function(scheme: string): string
+		return string.lower(scheme) .. ":"
+	end)
 	local seq = if string.find(link, "^https?://") then target_file.write(cx.pane, link) else 0
 	cx:open(`tern-rss://read/{cx.pane}?url={url.encode(link)}&seq={seq}&mode={config.reader_mode()}`)
 end
