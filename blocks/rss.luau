@@ -273,9 +273,23 @@ local function drawn_feeds(): ({ { name: string?, feed: store.Feed? } }, { store
 end
 
 local function selected_feed(state: State, feeds: { store.Feed }): (store.Feed?, number)
+	local want = state.sel.feeds
+	if want == nil then
+		return feeds[1], 1
+	end
 	for i, f in feeds do
-		if f.id == state.sel.feeds then
+		if f.id == want then
 			return f, i
+		end
+	end
+	-- A retarget in this or another block re-keyed the feed: follow it instead of jumping to the top.
+	local moved_to = store.resolve(want)
+	if moved_to ~= want then
+		for i, f in feeds do
+			if f.id == moved_to then
+				state.sel.feeds = moved_to
+				return f, i
+			end
 		end
 	end
 	return feeds[1], 1
@@ -510,7 +524,7 @@ end
 -- retargets; a dotted title such as `Node.js` has no path and stays a title. With neither, the whole
 -- line is the title.
 local function split_feed_fields(text: string): (string?, string?)
-	local s = string.match(text, "^%s*(.-)%s*$") or ""
+	local s = fmt.trim(text)
 	if s == "" then
 		return nil, nil
 	end
@@ -528,8 +542,8 @@ local function split_feed_fields(text: string): (string?, string?)
 		end
 		at = #s - #token + 1
 	end
-	local title = string.match(string.sub(s, 1, at - 1), "^%s*(.-)%s*$")
-	local u = string.match(string.sub(s, at), "^%s*(.-)%s*$")
+	local title = fmt.trim(string.sub(s, 1, at - 1))
+	local u = fmt.trim(string.sub(s, at))
 	return if title == "" then nil else title, if u == "" then nil else u
 end
 
@@ -655,19 +669,39 @@ local function submit_feed(state: State, cx: BlockCx, field: Field)
 		cx:render()
 		return
 	end
-	close_field(state, cx)
-	local ok = store.rename(target, title or "", u or "", function(err: string?, new_id: string?)
-		-- A retarget re-keys the feed; the selection follows it or it would fall back to the first row.
-		if new_id and new_id ~= target and state.sel.feeds == target then
-			state.sel.feeds = new_id
+	if store.feed(target) == nil then
+		close_field(state, cx)
+		cx:toast("info", "That feed is gone")
+		return
+	end
+	-- A retarget probes the network, so the field stays open meanwhile (as the add field does): on a
+	-- refusal the user still has what they typed, and nothing but the message changed.
+	state.add_busy = field
+	state.add_error = nil
+	local ok = store.rename(target, title or "", u or "", function(err: string?, _new_id: string?)
+		if state.add_busy == field then
+			state.add_busy = nil
 		end
-		if err then
+		-- Selection needs no fix here: selected_feed follows a re-keyed feed in every block.
+		if state.adding == field then
+			if err then
+				state.add_error = err
+				cx:render()
+				return
+			end
+			close_field(state, cx)
+		elseif err then
 			cx:toast("error", "Couldn't update that feed", err)
-		else
-			cx:toast("success", "Updated")
+			return
 		end
+		cx:toast("success", "Updated")
+		cx:render()
 	end)
 	if not ok then
+		if state.add_busy == field then
+			state.add_busy = nil
+		end
+		close_field(state, cx)
 		cx:toast("info", "Nothing to change")
 	end
 end
@@ -998,7 +1032,7 @@ local function add_nodes(state: State, f: Field): { Node }
 		}),
 	}
 	if state.add_busy == f then
-		table.insert(nodes, ui.node("spinner", { key = "add-busy", style = "dots", label = "Looking for a feed…" }))
+		table.insert(nodes, ui.node("spinner", { key = "add-busy", style = "dots", label = if f.intent == "feed" then "Checking that feed…" else "Looking for a feed…" }))
 	elseif state.add_error then
 		table.insert(nodes, cards.with(ui.text({ span(state.add_error, "error") }), { key = "add-error" }))
 	end
