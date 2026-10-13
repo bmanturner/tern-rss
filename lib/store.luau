@@ -193,9 +193,27 @@ local function save_feeds()
 	write_json(FEEDS_PATH, { version = 1, feeds = tern.json.array(table.clone(feeds_list)) })
 end
 
+-- Group names set aside while feeds.json.bad exists (see ensure_loaded). They are written back with
+-- the live ones, but never applied, pruned or shown.
+local held_groups: { [string]: boolean } = {}
+local held_excluded: { [string]: boolean } = {}
+
 -- Rule lines, so filters.json stays readable and hand-editable.
 local function save_filter()
-	write_json(FILTER_PATH, filter.encode(filter_cfg))
+	local out = filter.encode(filter_cfg)
+	if next(held_groups) ~= nil or next(held_excluded) ~= nil then
+		local groups = table.clone(held_groups)
+		for k in filter_cfg.groups do
+			groups[k] = true
+		end
+		local excluded = table.clone(held_excluded)
+		for k in filter_cfg.excluded do
+			excluded[k] = true
+		end
+		out.groups = groups
+		out.excluded = excluded
+	end
+	write_json(FILTER_PATH, out)
 end
 
 local function save_cache(id: string, c: Cache)
@@ -408,9 +426,17 @@ local function ensure_loaded()
 	load_read()
 	load_filter()
 	-- A group no feed carries any more (feeds.json edited by hand, or a crash between the two writes)
-	-- must not keep hiding every post. Not against a list that failed to load: that one is empty, and
-	-- pruning it would erase the user's groups for good.
-	if feeds_ok and filter.prune(filter_cfg, folder_set()) then
+	-- must not keep hiding every post. But while feeds.json.bad exists the list is not the user's
+	-- (it failed to load, or was rebuilt after a failure and the .bad copy may be restored): the saved
+	-- groups are set aside, neither applied nor pruned, and written back with every save. So a feed
+	-- added meanwhile is not hidden by a leftover whitelist, and restoring the .bad file still finds
+	-- the groups in filters.json. Deleting feeds.json.bad ends the protection at the next start.
+	local okx, bad_exists = pcall(tern.fs.exists, FEEDS_PATH .. ".bad")
+	if not feeds_ok or (okx and bad_exists) then
+		held_groups, held_excluded = filter_cfg.groups, filter_cfg.excluded
+		filter_cfg.groups, filter_cfg.excluded = {}, {}
+	end
+	if filter.prune(filter_cfg, folder_set()) then
 		save_filter()
 	end
 	local iv = interval()
@@ -1192,6 +1218,7 @@ function store.rename(id: string, title: string, target: string, done: (err: str
 	retargeting[id] = true
 	notify()
 	local dest: string = to
+	local title_at = f.title
 	probe({ dest }, function(hit: string?, r: FetchResult?, parsed: feed.Parsed?)
 		retargeting[id] = nil
 		local again = find(id)
@@ -1223,7 +1250,8 @@ function store.rename(id: string, title: string, target: string, done: (err: str
 		again.id = new_id
 		rekeyed[new_id] = nil
 		rekeyed[id] = new_id
-		if retitle and want then
+		-- A title edited while the probe was out is newer than the one typed with the URL.
+		if retitle and want and not (again.title_set and again.title ~= title_at) then
 			again.title = want
 			again.title_set = true
 		end

@@ -547,7 +547,8 @@ end
 -- retargets; a dotted title such as `Node.js` has no path and stays a title. With neither, the whole
 -- line is the title.
 local function split_feed_fields(text: string): (string?, string?)
-	local s = fmt.trim(text)
+	-- Unicode spaces (NBSP, U+3000) split like an ASCII one; %s knows only the latter.
+	local s = fmt.trim(fmt.normalize_blanks(text))
 	if s == "" then
 		return nil, nil
 	end
@@ -645,7 +646,8 @@ end
 
 -- The group field is synchronous: it writes the folder and closes. An empty line clears the group.
 local function submit_folder(state: State, cx: BlockCx, field: Field)
-	local target = field.target
+	-- The field names the id it was opened on; a retarget since then re-keyed the feed.
+	local target = if field.target then store.resolve(field.target) else nil
 	local name = field.text
 	close_field(state, cx)
 	if target == nil then
@@ -690,6 +692,12 @@ local function submit_feed(state: State, cx: BlockCx, field: Field)
 	local title, u = split_feed_fields(text)
 	if title == nil and u == nil then
 		state.add_error = "Type a title, a URL, or a title and a URL in one line"
+		cx:render()
+		return
+	end
+	if store.resolve(target) ~= target then
+		-- The prefilled URL is the old one: submitting it would retarget the feed back.
+		state.add_error = "This feed changed while you were editing. Press esc, then e again."
 		cx:render()
 		return
 	end

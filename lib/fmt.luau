@@ -162,6 +162,29 @@ function fmt.trim(text: string): string
 	return string.sub(text, first, last)
 end
 
+-- `text` with every blank character (ASCII or Unicode, as trim knows them) replaced by one ASCII
+-- space, so a pattern that only knows `%s` splits where the eye sees a gap. Linear.
+function fmt.normalize_blanks(text: string): string
+	local parts: { string } = {}
+	local copied = 1 -- first byte not yet copied
+	local i = 1
+	local n = #text
+	while i <= n do
+		local len = blank_at(text, i)
+		if len > 1 or (len == 1 and string.byte(text, i) ~= 0x20) then
+			table.insert(parts, string.sub(text, copied, i - 1))
+			table.insert(parts, " ")
+			copied = i + len
+		end
+		i += math.max(len, 1)
+	end
+	if copied == 1 then
+		return text
+	end
+	table.insert(parts, string.sub(text, copied))
+	return table.concat(parts)
+end
+
 -- `ms` as "8.4s", "42s", "1m 12s" or "2h 5m".
 function fmt.duration(ms: number): string
 	if ms < 10000 then
