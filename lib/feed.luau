@@ -331,7 +331,7 @@ local function decode_attrs(s: string, loose: boolean?): { [string]: string }
 	local pos = 1
 	while true do
 		local name_from, name_to = string.find(s, "[%w_:%-%.]+", pos)
-		if name_from == nil then
+		if name_from == nil or name_to == nil then
 			break
 		end
 		local _, eq_to = string.find(s, "^%s*=%s*", name_to + 1)
@@ -1307,7 +1307,7 @@ local function finish_md(text: string, quoted: boolean): string
 			prefix, line = "- ", string.sub(line, 2)
 		elseif mark == 2 or mark == 4 then
 			local num, rest = string.match(line, "^[\2\4](%d+)\3(.*)$")
-			if num then
+			if num and rest then
 				prefix = if mark == 2 then num .. ". " else string.rep("#", tonumber(num) :: number) .. " "
 				line = rest
 			end
@@ -1382,11 +1382,11 @@ local IMAGE_SOURCES = { "data-src", "data-lazy-src", "data-original", "src", "sr
 -- and not a private or loopback address unless `private_ok` (the article itself is one).
 local function image_src(attrs: { [string]: string }, base: string, private_ok: boolean): string?
 	for _, key in IMAGE_SOURCES do
-		local value = attrs[key]
-		if value and (key == "srcset" or key == "data-srcset") then
-			value = string.match(value, "^%s*([^%s,]+)") -- the first candidate's URL
+		local raw: string? = attrs[key]
+		if raw and (key == "srcset" or key == "data-srcset") then
+			raw = string.match(raw, "^%s*([^%s,]+)") -- the first candidate's URL
 		end
-		value = trim(value or "")
+		local value = trim(raw or "")
 		if value ~= "" and #value < 2048 then
 			local abs = url.resolve(base, value)
 			if
@@ -1527,7 +1527,9 @@ local function render(inner: string, kind: string, base: string, furniture: bool
 			end
 			return nil
 		end
-		if furniture and not closing and FURNITURE[name] and not (name == "header" and kind == "article") then
+		-- An article's own <header> holds its title and byline, so only other headers are furniture.
+		local own_header = kind == "article" and name == "header"
+		if furniture and not closing and FURNITURE[name] and not own_header then
 			skip_name, skip_depth, dropped = name, 1, true
 			return nil
 		end

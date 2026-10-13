@@ -423,10 +423,12 @@ end
 local function panel_move_rule(state: State, index: number, up: boolean, at: number): boolean
 	local cfg = store.filter()
 	local to = if up then index - 1 else index + 1
-	if to < 1 or to > #cfg.rules then
+	local moved = cfg.rules[index]
+	if moved == nil or to < 1 or to > #cfg.rules then
 		return false
 	end
-	table.insert(cfg.rules, to, table.remove(cfg.rules, index))
+	table.remove(cfg.rules, index)
+	table.insert(cfg.rules, to, moved)
 	store.set_filter(cfg)
 	state.panel_at = at + (if up then -1 else 1)
 	return true
@@ -563,8 +565,9 @@ local function split_feed_fields(text: string): (string?, string?)
 		end
 		at = #s - #token + 1
 	end
-	local title = fmt.trim(string.sub(s, 1, at - 1))
-	local u = fmt.trim(string.sub(s, at))
+	local start = at :: number -- the scheme search found it, or the bare host-and-path token did
+	local title = fmt.trim(string.sub(s, 1, start - 1))
+	local u = fmt.trim(string.sub(s, start))
 	return if title == "" then nil else title, if u == "" then nil else u
 end
 

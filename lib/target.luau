@@ -49,7 +49,10 @@ function target.write(owner: number, u: string): number
 	end
 	local prev = target.read(owner)
 	local seq = (if prev then prev.seq else 0) + 1
-	local ok, err = pcall(tern.fs.write, path(owner), tern.json.encode({ url = u, seq = seq }))
+	local ok, err = pcall(function(): nil
+		tern.fs.write(path(owner), tern.json.encode({ url = u, seq = seq }))
+		return nil
+	end)
 	if not ok then
 		tern.log.warn("tern-rss: cannot record the reader target", err)
 	end

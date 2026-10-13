@@ -89,7 +89,7 @@ local function pull_title(blocks: { feed.ArticleBlock }): string?
 	local first = blocks[1]
 	if first and first.kind == "md" and first.text then
 		local level, text, after = string.match(first.text, "^(#+)%s*(%S[^\n]*)()")
-		if level then
+		if level and text and after then
 			local rest = string.sub(first.text, after)
 			if string.match(rest, "%S") then
 				first.text = rest
@@ -299,7 +299,8 @@ local reader: BlockDef<State> = {
 		end
 		local blobs = state.blobs or {}
 		local parts: { Node } = {}
-		for i, b in state.blocks or {} do
+		local blocks: { feed.ArticleBlock } = state.blocks or {}
+		for i, b in blocks do
 			if b.kind == "md" and b.text then
 				table.insert(parts, cards.with(ui.md(b.text), { key = "b" .. i }))
 			elseif b.kind == "img" and b.src then

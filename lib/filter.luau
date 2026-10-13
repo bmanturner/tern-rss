@@ -503,7 +503,9 @@ function filter.parse(line: string, stored: boolean?): (Rule?, string?)
 			end
 			return nil, `A scope needs a name: @group or #feed`
 		end
-		scope = if mark == "@" then { kind = "group", name = name } else { kind = "feed", key = name }
+		-- A missing closing quote returned above, so the name is a string here.
+		local named = name :: string
+		scope = if mark == "@" then { kind = "group", name = named } else { kind = "feed", key = named }
 		i = after
 	end
 	local action = "drop"
@@ -786,9 +788,9 @@ function filter.decode(v: any): (Config, number)
 	end
 	cfg.groups = names(v.groups)
 	cfg.excluded = names(v.excluded)
-	for _, state in READ_STATES do
-		if v.read == state then
-			cfg.read = state
+	for _, s: ReadState in READ_STATES do
+		if v.read == s then
+			cfg.read = s
 		end
 	end
 	local bad = 0
