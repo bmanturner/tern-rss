@@ -182,9 +182,10 @@ local function scan(pat: string, extended: boolean): (boolean, boolean)
 end
 
 -- Text a pattern has to survive when the rule is added: empty, short, runs of one letter, words,
--- spaces, and the near-miss endings that make nested quantifiers backtrack. Each test is bounded by
--- the engine's step limit, so a pattern that cannot finish on one of these is refused here instead of
--- being found out on a real post.
+-- spaces, the near-miss endings that make nested quantifiers backtrack, and a post-sized run of
+-- words (a title and a 600-character preview), where a pattern that is quadratic in the text shows.
+-- Each test is bounded by the engine's step limit, so a pattern that cannot finish on one of these
+-- is refused here instead of being found out on a real post.
 local SAMPLES: { string } = {
 	"",
 	"b",
@@ -194,7 +195,20 @@ local SAMPLES: { string } = {
 	string.rep("a ", 20) .. "!",
 	string.rep("word ", 8) .. "!",
 	string.rep(" ", 40),
+	string.rep("lorem ipsum dolor sit amet, ", 30),
 }
+
+-- `pat` without leading `.*` (or `.*?`). A rule only asks whether the pattern matches anywhere, and
+-- `.*X` matches somewhere exactly when `X` does, but the engine retries `.*` from every position and
+-- runs it to the end each time, which is quadratic in the post: `/.*sponsor.*/` gave up on a
+-- 600-character preview. Removing it changes no group numbers. A pattern that is nothing else stays.
+local function drop_leading_any(pat: string): string
+	local s = pat
+	while string.sub(s, 1, 2) == ".*" and string.sub(s, 3, 3) ~= "+" do
+		s = string.sub(s, if string.sub(s, 3, 3) == "?" then 4 else 3)
+	end
+	return if s == "" then pat else s
+end
 
 -- Compiles `pat` with `flags`. Returns the compiled pattern, or nil and the engine's complaint.
 --
@@ -210,6 +224,7 @@ local SAMPLES: { string } = {
 --   * A quantified group that can match empty never finishes, and nested quantifiers can backtrack
 --     without end. lib/regexp counts its steps and raises past a limit; the samples above find the
 --     patterns that hit it, and the same limit marks a rule slow if a real post finds one first.
+--   * A leading `.*` makes every search quadratic in the post; it is dropped (drop_leading_any).
 function filter.compile(pat: string, flags: string): (any?, string?)
 	for i = 1, #flags do
 		local c = string.sub(flags, i, i)
@@ -217,12 +232,13 @@ function filter.compile(pat: string, flags: string): (any?, string?)
 			return nil, `Unknown flag "{c}"; the flags are i, m, s and x`
 		end
 	end
-	local alternation, boundary = scan(pat, string.find(flags, "x", 1, true) ~= nil)
+	local body = drop_leading_any(pat)
+	local alternation, boundary = scan(body, string.find(flags, "x", 1, true) ~= nil)
 	if boundary then
 		return nil, "The engine cannot run \\b or \\B; use a capture like (^| )word, or stop at spaces"
 	end
 	local close = if string.find(flags, "x", 1, true) then "\n)" else ")"
-	local source = if alternation then `(?:{pat}{close}` else pat
+	local source = if alternation then `(?:{body}{close}` else body
 	local ok, rx = pcall(function()
 		return regexp.new(source, flags)
 	end)
@@ -231,11 +247,14 @@ function filter.compile(pat: string, flags: string): (any?, string?)
 		local message = string.match(tostring(rx), "^[^:]*:%d+: (.*)$") or tostring(rx)
 		return nil, `Pattern error: {message}`
 	end
-	for _, sample in SAMPLES do
+	for i, sample in SAMPLES do
 		local ran, err = pcall(function()
 			return rx:test(sample)
 		end)
 		if not ran and string.find(tostring(err), STEP_ERROR, 1, true) then
+			if i == #SAMPLES then
+				return nil, "That pattern is too slow on a post-length text; simplify it (a rule already matches anywhere, so it needs no (.*) around it)"
+			end
 			return nil, "That pattern can loop or backtrack without end; simplify its repeated groups"
 		end
 	end
