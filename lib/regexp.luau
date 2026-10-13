@@ -4,7 +4,7 @@
 -- engine, adapted from Blockzez. MIT (see lib/regexp.LICENSE). Keep it byte-for-byte apart from
 -- this header: it is third-party code, so `--!nolint --!nocheck` stay on and nothing is renamed.
 --
--- Patched in two places, and nothing else is touched:
+-- Patched in three places, and nothing else is touched:
 --   1. `re.new` sets `caseless` and `dotall`, while the matcher read `ignoreCase` and `dotAll`, so
 --      the `i` and `s` flags did nothing at all (as of upstream 2102-line HEAD). Those reads are
 --      renamed here.
@@ -13,6 +13,10 @@
 --      empty, such as `(a*)*b`, loops forever, and `(\w+\s?)+$` backtracks exponentially. Neither can
 --      be interrupted from outside, so a user's pattern could hang the host. The limit is the
 --      `STEP_LIMIT` local just above `re_rawfind`.
+--   3. The single-token quantifier loop (`\1*`, `x{2,}`) counts a step per repeat too, and a
+--      backreference to an empty capture stops after the minimum count and leaves no backtrack state:
+--      upstream repeats it without end at one position (`(a?)\1*x` never returned, with no step
+--      counted anywhere in that loop).
 -- Why it lives here: Luau ships no regex and Tern has no dependency manager, so a plugin that
 -- wants real patterns has to carry the engine. lib/filter.luau is the only caller.
 --[[
@@ -674,6 +678,11 @@ local function re_rawfind(token, str_arr, init, flags, verb_flags, as_bool)
 					local min_max_i = str_i + ctkn[2] * pattern_count;
 					local mcount = 0;
 					while mcount < ctkn[3] do
+						-- Patch 3: this loop is a step too, whatever it matches.
+						steps += 1;
+						if steps > STEP_LIMIT then
+							error("regexp: step limit", 0);
+						end;
 						if is_backref then
 							if start_i and end_i then
 								local org_i = str_i;
@@ -688,9 +697,15 @@ local function re_rawfind(token, str_arr, init, flags, verb_flags, as_bool)
 						end;
 						str_i += pattern_count;
 						mcount += 1;
+						if pattern_count == 0 then
+							-- Patch 3: a backreference to an empty capture matches empty however often
+							-- it repeats; going on would never move str_i and never reach `ctkn[3]`.
+							mcount = math.max(mcount, ctkn[2]);
+							break;
+						end;
 					end;
 					match = mcount >= ctkn[2];
-					if match and ctkn[4] ~= "possessive" then
+					if match and ctkn[4] ~= "possessive" and pattern_count > 0 then
 						if ctkn[4] == "lazy" then
 							min_max_i, str_i = str_i, min_max_i;
 						end;
